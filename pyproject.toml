@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "argus-monitor"
+version = "0.1.0"
+description = "Camera-based AI print-failure detector for Klipper/Moonraker printers."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "numpy>=1.24",
+    "PyYAML>=6.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+runtime = [
+    "onnxruntime>=1.16",
+    "opencv-python-headless>=4.8",
+]
+train = [
+    "ultralytics>=8.1",
+]
+dev = [
+    "pytest>=7.4",
+]
+
+[project.scripts]
+argus = "argus.service:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

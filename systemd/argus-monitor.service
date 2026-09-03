@@ -1,0 +1,17 @@
+[Unit]
+Description=Argus Monitor -- camera-based AI print-failure detection
+After=network.target moonraker.service
+Wants=moonraker.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/argus-monitor
+EnvironmentFile=-/home/pi/argus-monitor/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/pi/argus-monitor/.venv/bin/python -m argus.service --config /home/pi/argus-monitor/config.yaml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
