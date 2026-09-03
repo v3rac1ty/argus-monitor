@@ -1,0 +1,151 @@
+# Argus Monitor configuration.
+#
+# Copy this file (e.g. to config.yaml) and edit as needed, then run:
+#   argus --config config.yaml
+#
+# Any string value of the exact form "env:VAR_NAME" is replaced at load time
+# with os.environ["VAR_NAME"] (or None if that variable is unset). Use this
+# to keep secrets such as the Discord webhook URL out of version control.
+
+# Camera capture: where frames come from and at what size/rate.
+camera:
+  source: "0"              # "0"=/dev/video0, an http(s) MJPEG/snapshot URL, or a directory path for replay
+  width: 1280
+  height: 720
+  fps: 5
+  reconnect_backoff_s: 2.0
+  max_reconnect_backoff_s: 30.0
+
+# ONNX detector: model location, preprocessing, and per-class confidence
+# thresholds. class_thresholds and severity must list exactly the same class
+# names -- every class needs both a threshold and a severity, or config
+# loading will fail.
+detector:
+  model_path: "models/argus.onnx"
+  input_size: 512          # model is trained and exported at 512x512; dataset images are natively 512x512
+  providers: ["CPUExecutionProvider"]
+  # Output contract of the ONNX model. Two supported models produce two
+  # different raw output shapes:
+  #   - "auto"    (default) auto-detect from the model's output shape at
+  #                load time: raw YOLOv8 predictions "(1, 4+nc, N)" (or its
+  #                transpose) vs. YOLO26's decoded, NMS-free end-to-end
+  #                output "(1, 300, 6)". Safe for our 5-class model, where
+  #                the two shapes can't be confused.
+  #   - "yolov8"   force the legacy YOLOv8 raw-prediction contract
+  #                (transpose + argmax + class-aware NMS applied here).
+  #   - "end2end"  force YOLO26's decoded contract (already-NMS'd
+  #                [x1, y1, x2, y2, confidence, class_id] rows -- no NMS is
+  #                applied here).
+  # NOTE: if you ever train with exactly 2 classes, 4+nc == 6 and "auto"
+  # can no longer tell the two layouts apart by shape alone (it will prefer
+  # "yolov8"); pin this explicitly in that case.
+  layout: "auto"
+  nms_iou: 0.45
+  default_threshold: 0.50
+  # Measured on the held-out test split by training/evaluate.py, which
+  # selects each class's threshold to hit a target precision of >= 0.95.
+  # These must be re-derived (re-run training/evaluate.py) whenever the
+  # model is retrained -- they are specific to the current weights, not
+  # general-purpose defaults. Measured operating points at these
+  # thresholds (from runs/evaluation.json):
+  class_thresholds:
+    spaghetti: 0.75         # P=0.656 R=0.065 -- target precision NOT met; best real operating point
+    warping: 0.76           # P=0.951 R=0.065 -- "met" on ~2 true detections (31 instances total); see severity note below
+    stringing: 0.30         # P=0.857 R=0.143 -- target precision NOT met; best real operating point
+    zits: 0.75              # P=0.921 R=0.056 -- target precision NOT met; best real operating point
+    "error extrusion": 0.64 # P=0.950 R=0.059 -- target precision MET
+  # Severity gates which classes are allowed to drive automated action
+  # (see decision.action_mode below); cosmetic classes are still detected
+  # and logged, they just cannot trigger a pause/cancel. spaghetti is the
+  # only catastrophic class right now.
+  #
+  # warping was demoted from catastrophic to cosmetic despite its
+  # apparent P=0.951 above: the held-out split has only 19 images / 31
+  # instances of warping in total, and that precision is measured at
+  # recall 0.065 -- roughly two true detections. That's statistical
+  # noise, not evidence a print should be stopped over. Promote it back
+  # to catastrophic only once a retrained model demonstrates genuine
+  # precision on a materially larger warping sample.
+  severity:
+    spaghetti: catastrophic
+    warping: cosmetic
+    stringing: cosmetic
+    zits: cosmetic
+    "error extrusion": cosmetic
+
+# Temporal DecisionEngine: turns a stream of per-frame detections into a
+# smoothed score and, eventually, an action (notify / pause / cancel).
+#
+# These defaults are intentionally conservative -- a false positive kills a
+# long print, which is far more costly than reacting a few seconds late to
+# a real one. That shows up in several places:
+#   - ema_alpha is low-ish (0.35) so a single noisy frame can't swing the
+#     smoothed score on its own.
+#   - warn/pause/cancel all require BOTH a minimum vote count within the
+#     window AND a run of consecutive high-confidence ticks, not just one
+#     instant of high score.
+#   - cancel_enabled defaults to false and action_mode defaults to
+#     notify_only, so out of the box the system only ever notifies a human --
+#     it will not touch the print until an operator opts in to pause/cancel.
+#   - warmup_s gives the first layers (most failure-prone/least predictive
+#     period) time to settle before detection results can trigger anything.
+decision:
+  tick_interval_s: 1.0
+  warmup_s: 180
+  ema_alpha: 0.35
+  window: 12
+  vote_threshold: 0.55
+  warn_score: 0.60
+  warn_votes: 4
+  pause_score: 0.75
+  pause_votes: 6
+  pause_consecutive: 3
+  cancel_score: 0.92
+  cancel_votes: 9
+  cancel_consecutive: 2
+  cancel_enabled: false
+  clear_score: 0.40
+  clear_ticks: 5
+  cooldown_s: 300
+  # Measured reality on the current model: spaghetti (the only catastrophic
+  # class) reaches only ~0.66 precision at its best real operating point
+  # (conf 0.75), i.e. roughly one in three alarms would be a false positive.
+  # notify_only is therefore the correct and deliberate default, not a
+  # placeholder -- enable pause only after tools/calibrate.py demonstrates
+  # an acceptable false-positives-per-hour figure on the user's own
+  # recorded prints.
+  action_mode: "notify_only"   # notify_only | pause | cancel -- ceiling on automated action
+
+# Pre-inference frame quality gate: reject frames too dark/bright/blurry/stale
+# to trust, rather than feeding garbage into the detector and decision engine.
+quality:
+  min_mean_luma: 20.0
+  max_mean_luma: 240.0
+  min_blur_var: 45.0
+  max_frame_age_s: 5.0
+
+# Moonraker (Klipper API) connection used to poll print state and, if
+# action_mode allows it, pause/cancel the print.
+moonraker:
+  base_url: "http://localhost:7125"
+  timeout_s: 5.0
+  poll_interval_s: 1.0
+  pause_macro: null        # e.g. "DETECTION_PAUSE" to call a gcode macro instead of the raw pause endpoint
+
+# Discord webhook notifications. discord_webhook_url is loaded from the
+# DISCORD_WEBHOOK_URL environment variable so it never ends up committed.
+notify:
+  discord_webhook_url: "env:DISCORD_WEBHOOK_URL"
+  attach_frame: true
+  min_interval_s: 60
+
+# Local storage: where the JSONL event log and captured frames are written,
+# and how much of that to keep.
+storage:
+  event_log: "logs/events.jsonl"
+  frame_dir: "captures"
+  max_frames: 500
+  retention_days: 14
+
+logging:
+  level: "INFO"

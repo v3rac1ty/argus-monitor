@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# ML datasets / training artifacts / weights
+datasets/
+runs/
+models/*.onnx
+models/*.pt
+*.pt
+*.onnx
+
+# Runtime data
+captures/
+logs/
+*.log
+
+# Secrets
+.env
+
+# OS cruft
+.DS_Store
+Thumbs.db
