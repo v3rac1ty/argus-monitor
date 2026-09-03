@@ -20,7 +20,15 @@ camera:
 # thresholds. class_thresholds and severity must list exactly the same class
 # names -- every class needs both a threshold and a severity, or config
 # loading will fail.
+#
+# kind selects which detector implementation is built: "detection" (below,
+# the active default) for the ONNX object detector, or "classification" for
+# a whole-frame ONNX classifier -- see the commented-out block near the
+# bottom of this section for how to switch. The DecisionEngine only ever
+# consumes p_failure (never bounding boxes), so either path is a drop-in
+# replacement for the other; nothing outside this section needs to change.
 detector:
+  kind: "detection"
   model_path: "models/argus.onnx"
   input_size: 512          # model is trained and exported at 512x512; dataset images are natively 512x512
   providers: ["CPUExecutionProvider"]
@@ -72,6 +80,53 @@ detector:
     stringing: cosmetic
     zits: cosmetic
     "error extrusion": cosmetic
+
+  # --- Classification path ------
+  # A classifier predicts one whole-frame label per frame instead of boxes.
+  # The DecisionEngine only ever consumes p_failure, never bounding boxes,
+  # so this is a drop-in replacement for the detection path above -- flip
+  # `kind` and point model_path/input_size/class_names at your classifier to
+  # switch. To actually use this, delete the "detection" block above (or set
+  # its keys as shown here) -- only one `detector:` section is read.
+  #
+  # kind: "classification"
+  # model_path: "models/argus_classifier.onnx"
+  # input_size: 512          # must match the classifier's training-time input size
+  # providers: ["CPUExecutionProvider"]
+  # class_names: ["cracking", "layer_shifting", "normal", "spaghetti", "stringing", "warping"]
+  # default_threshold: 0.50
+  # class_thresholds:
+  #   cracking: 0.75
+  #   layer_shifting: 0.75
+  #   normal: 0.50            # unused: a "normal" prediction short-circuits to zero
+  #                           # detections before any threshold is consulted (see
+  #                           # ClassifierDetector / postprocess_classify); listed
+  #                           # only because class_thresholds and severity below
+  #                           # must define exactly the same set of class names.
+  #   spaghetti: 0.75
+  #   stringing: 0.50
+  #   warping: 0.75
+  # severity:
+  #   # Severity (argus.types) only has catastrophic/cosmetic -- there's no
+  #   # "not a defect" value, and types.py is a frozen contract we don't
+  #   # touch. So "normal" predictions aren't tagged cosmetic; they're
+  #   # excluded entirely (zero Detections, p_failure == 0.0). This entry is
+  #   # never actually consulted at runtime -- see class_thresholds.normal
+  #   # above for why it's still listed.
+  #   #
+  #   # spaghetti is the only catastrophic class (able to drive pause/cancel
+  #   # -- see decision.action_mode), matching the detection path's severity
+  #   # map above and training/evaluate_classifier.py's
+  #   # CATASTROPHIC_CLASS_NAME / training/export_classifier_onnx.py's
+  #   # _SEVERITY_MAP_NAMES. cracking and layer_shifting are cosmetic-only
+  #   # until a retrained model demonstrates real precision for them, same
+  #   # reasoning as the detection path's warping demotion above.
+  #   cracking: cosmetic
+  #   layer_shifting: cosmetic
+  #   normal: cosmetic
+  #   spaghetti: catastrophic
+  #   stringing: cosmetic
+  #   warping: cosmetic
 
 # Temporal DecisionEngine: turns a stream of per-frame detections into a
 # smoothed score and, eventually, an action (notify / pause / cancel).

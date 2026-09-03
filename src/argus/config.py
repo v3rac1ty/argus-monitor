@@ -30,6 +30,8 @@ _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
 _VALID_DETECTOR_LAYOUTS = {"auto", "yolov8", "end2end"}
 
+_VALID_DETECTOR_KINDS = {"detection", "classification"}
+
 
 class ConfigError(Exception):
     """Raised when a config file is malformed or fails validation."""
@@ -56,10 +58,18 @@ class CameraConfig:
 class DetectorConfig:
     """ONNX detector model, preprocessing, and per-class thresholds.
 
-    Supports both the legacy YOLOv8 raw-prediction output contract and
-    YOLO26's NMS-free end-to-end contract -- see `layout`.
+    `kind` selects which `Detector` implementation `build_service` would
+    construct: `"detection"` (default) for the ONNX object detector
+    (`OnnxYoloDetector`, supporting both the legacy YOLOv8 raw-prediction
+    output contract and YOLO26's NMS-free end-to-end contract -- see
+    `layout`), or `"classification"` for a whole-frame ONNX classifier
+    (`ClassifierDetector`). `class_names` is the ordered class list matching
+    the model's output index order; it is required (must be non-empty) when
+    `kind == "classification"` since a classifier has no other way to know
+    what its output indices mean.
     """
 
+    kind: str = "detection"
     model_path: str = "models/argus.onnx"
     input_size: int = 640
     providers: tuple[str, ...] = ("CPUExecutionProvider",)
@@ -68,6 +78,7 @@ class DetectorConfig:
     class_thresholds: dict[str, float] = field(default_factory=dict)
     severity: dict[str, Severity] = field(default_factory=dict)
     layout: str = "auto"
+    class_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -258,6 +269,9 @@ def _build_detector(data: Any) -> DetectorConfig:
     if data.get("providers") is not None:
         data["providers"] = tuple(data["providers"])
 
+    if data.get("class_names") is not None:
+        data["class_names"] = tuple(data["class_names"])
+
     severity_raw = data.get("severity")
     if severity_raw is not None:
         if not isinstance(severity_raw, dict):
@@ -329,6 +343,15 @@ def _validate(config: Config) -> None:
     s = config.storage
 
     # --- detector ---
+    if det.kind not in _VALID_DETECTOR_KINDS:
+        raise ConfigError(
+            f"detector.kind must be one of {sorted(_VALID_DETECTOR_KINDS)}, got {det.kind!r}"
+        )
+    if det.kind == "classification" and not det.class_names:
+        raise ConfigError(
+            "detector.class_names is required (and must be non-empty) when "
+            "detector.kind == 'classification'"
+        )
     if det.layout not in _VALID_DETECTOR_LAYOUTS:
         raise ConfigError(
             f"detector.layout must be one of {sorted(_VALID_DETECTOR_LAYOUTS)}, got {det.layout!r}"
