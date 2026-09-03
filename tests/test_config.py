@@ -65,10 +65,12 @@ def test_camera_defaults():
 def test_detector_defaults():
     config = load_config()
     det = config.detector
+    assert det.kind == "detection"
     assert det.model_path == "models/argus.onnx"
     assert det.input_size == 512
     assert det.providers == ("CPUExecutionProvider",)
     assert det.layout == "auto"
+    assert det.class_names == ()
     assert det.nms_iou == 0.45
     assert det.default_threshold == 0.50
     assert det.class_thresholds == {
@@ -201,6 +203,61 @@ def test_detector_layout_invalid_value_rejected():
     data["detector"]["layout"] = "yolov5"
     with pytest.raises(ConfigError):
         Config.from_dict(data)
+
+
+def test_detector_kind_valid_values_accepted():
+    for value in ("detection", "classification"):
+        data = _base_dict()
+        data["detector"]["kind"] = value
+        if value == "classification":
+            data["detector"]["class_names"] = ["normal", "spaghetti"]
+        config = Config.from_dict(data)
+        assert config.detector.kind == value
+
+
+def test_detector_kind_invalid_value_rejected():
+    data = _base_dict()
+    data["detector"]["kind"] = "segmentation"
+    with pytest.raises(ConfigError):
+        Config.from_dict(data)
+
+
+def test_classification_kind_requires_class_names():
+    data = _base_dict()
+    data["detector"]["kind"] = "classification"
+    # class_names deliberately left unset (absent from the example config)
+    with pytest.raises(ConfigError):
+        Config.from_dict(data)
+
+
+def test_classification_kind_with_class_names_accepted():
+    data = _base_dict()
+    data["detector"]["kind"] = "classification"
+    data["detector"]["class_names"] = [
+        "normal",
+        "spaghetti",
+        "cracking",
+        "layer_shifting",
+        "stringing",
+        "warping",
+    ]
+    config = Config.from_dict(data)
+    assert config.detector.class_names == (
+        "normal",
+        "spaghetti",
+        "cracking",
+        "layer_shifting",
+        "stringing",
+        "warping",
+    )
+
+
+def test_detection_kind_does_not_require_class_names():
+    data = _base_dict()
+    data["detector"]["kind"] = "detection"
+    # class_names absent -- detection path doesn't need it
+    config = Config.from_dict(data)
+    assert config.detector.class_names == ()
 
 
 def test_pause_score_below_warn_score_rejected():
