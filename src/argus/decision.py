@@ -1,22 +1,12 @@
 """Temporal DecisionEngine: converts a noisy per-frame failure score into a
-small number of trustworthy actions (NOTIFY / PAUSE / CANCEL).
+small number of trustworthy actions (NOTIFY / PAUSE / CANCEL) via an EMA,
+a rolling vote window, consecutive-tick requirements, and a cooldown +
+hysteresis cycle after any action fires.
 
-A single raw per-frame model score (`p_raw`) is far too noisy to act on
-directly -- a single blurry frame or a stray shadow can spike it to 0.99.
-This engine smooths that signal with an EMA, requires sustained agreement
-across a rolling vote window, requires several consecutive qualifying ticks
-before firing, and enforces a cooldown + hysteresis cycle after any action
-fires so a single failure can never produce a burst of repeated actions.
-
-The overriding design goal is a LOW FALSE-POSITIVE RATE: a false PAUSE/CANCEL
-kills a print that may have been running for many hours. Every knob here
-biases toward "when in doubt, do nothing" -- see config.example.yaml's
-`decision` section (mirrored by `argus.config.DecisionConfig`) for the
-tunable thresholds.
-
-`tick()` never calls `time.time()`; the caller passes an explicit `now` unix
-timestamp so tests (and the low-FPR test in particular) can drive time
-deterministically.
+Design goal is a LOW FALSE-POSITIVE RATE (a false PAUSE/CANCEL kills a
+print that may have run for hours); tunables live in
+`argus.config.DecisionConfig`. `tick()` takes an explicit `now` rather than
+calling `time.time()` so tests can drive it deterministically.
 """
 
 from __future__ import annotations
@@ -38,27 +28,19 @@ from argus.types import (
 
 
 class DecisionEngine:
-    """Stateful temporal decision engine driven one tick at a time.
-
-    One instance is meant to live for the lifetime of the monitoring
-    process and track exactly one print at a time; `tick()` detects a
-    positively-confirmed change of print identity (a new filename, or
-    leaving PRINTING for a confirmed terminal state) and resets its
-    internal accumulators automatically -- see `_apply_identity_reset`.
-
-    Crucially, a change of identity must be *confirmed*, not merely
-    *undetermined*. `MoonrakerClient.get_print_state` is fail-closed: any
-    transient failure (connection error, timeout, HTTP error, malformed
-    response) comes back as `PrintState(state=UNKNOWN, filename=None, ...)`
-    rather than raising. Treating that the same as "the print ended" would
-    let a single flaky Moonraker poll mid-print wipe out every accumulated
-    vote and EMA sample, which on a real, sustained failure can prevent
-    enough evidence from ever accumulating to fire -- a missed detection,
-    which is just as much a failure of this system as a false positive.
-    So `_apply_identity_reset` only resets on positive confirmation and
-    preserves accumulators whenever the state is merely unknown or paused.
+    """Stateful temporal decision engine driven one tick at a time; tracks one
+    print and resets on a *confirmed* identity change (new filename, or a
+    confirmed terminal state). UNKNOWN/PAUSED states preserve accumulators
+    instead of resetting, since Moonraker fails closed to UNKNOWN on transient
+    errors -- see `_apply_identity_reset`.
     """
 
+    # None __init__(self, DecisionConfig cfg)
+    # Inputs: DecisionConfig cfg - smoothing/voting/threshold/cooldown tuning for this engine
+    #                               instance
+    # Outputs: None
+    # Description: Stores the config and initializes all temporal state via `reset()`.
+    # Side Effects: Delegates to reset() (see its Side Effects).
     def __init__(self, cfg: DecisionConfig) -> None:
         self._cfg = cfg
         self.reset()
@@ -67,12 +49,18 @@ class DecisionEngine:
     # Public API
     # ------------------------------------------------------------------
 
+    # None reset(self)
+    # Inputs: None
+    # Outputs: None
+    # Description: Resets every temporal accumulator (EMA score, vote window, consecutive
+    #              counters, warn latch, cooldown deadline, clear counter, previous print state)
+    #              and the state machine back to IDLE. Called on construction, on an explicit
+    #              external reset, and internally whenever `tick()` detects a new print.
+    # Side Effects: Mutates every instance attribute holding temporal state (self._state,
+    #               self._score, self._vote_window, self._votes, self._warn_consec,
+    #               self._pause_consec, self._cancel_consec, self._warn_latch,
+    #               self._cooldown_until, self._clear_consec, self._prev_print_state).
     def reset(self) -> None:
-        """Reset every temporal accumulator and the state machine to fresh.
-
-        Called on construction, on an explicit external reset, and
-        internally whenever `tick()` detects a new print (Step 1).
-        """
         self._state: DecisionState = DecisionState.IDLE
         self._score: float = 0.0
         self._vote_window: "deque[bool]" = deque(maxlen=max(1, self._cfg.window))
@@ -89,11 +77,41 @@ class DecisionEngine:
 
         self._prev_print_state: Optional[PrintState] = None
 
+    # DecisionState state(self)
+    # Inputs: None
+    # Outputs: DecisionState - the engine's current state-machine state
+    # Description: Read-only accessor for the current state-machine state.
+    # Side Effects: None
     @property
     def state(self) -> DecisionState:
-        """Current state-machine state."""
         return self._state
 
+    # Decision tick(self, float p_raw, tuple[Detection, ...] detections, Optional[PrintState] print_state, GateResult quality, float now)
+    # Inputs: float p_raw - raw (unsmoothed) per-frame failure probability for this tick
+    #         tuple[Detection, ...] detections - detections observed on this tick, carried
+    #                                             through unchanged into the returned Decision
+    #         Optional[PrintState] print_state - current Moonraker print snapshot, or None if
+    #                                             unavailable
+    #         GateResult quality - pre-inference quality gate outcome for the frame behind this
+    #                               tick
+    #         float now - caller-supplied unix timestamp for this tick (never read internally via
+    #                      time.time(), so tests can drive time deterministically)
+    # Outputs: Decision - the action (NONE/NOTIFY/PAUSE/CANCEL), resulting state, and full
+    #                     scoring detail for this tick
+    # Description: Advances the engine by one tick: applies a print-identity reset if positively
+    #              confirmed, gates the tick (not-printing/warmup/quality) without touching
+    #              temporal state if gated, otherwise updates the EMA score and vote window,
+    #              evaluates warn/pause/cancel level conditions and consecutive-tick counters,
+    #              enforces cooldown/hysteresis, clamps any candidate action to the configured
+    #              action_mode ceiling, and returns the resulting Decision.
+    # Side Effects: Mutates nearly all of the engine's temporal state (self._state, self._score,
+    #               self._vote_window, self._votes, self._warn_consec, self._pause_consec,
+    #               self._cancel_consec, self._warn_latch, self._cooldown_until,
+    #               self._clear_consec, self._prev_print_state) -- except on a gated tick (Step
+    #               2), which deliberately leaves EMA/vote/consecutive state untouched. May call
+    #               self.reset() via _apply_identity_reset. Does not itself call Moonraker,
+    #               notify, or storage -- those are the caller's (ArgusService's) responsibility
+    #               based on the returned Decision.action.
     def tick(
         self,
         *,
@@ -103,7 +121,6 @@ class DecisionEngine:
         quality: GateResult,
         now: float,
     ) -> Decision:
-        """Process one frame's worth of signal and return the Decision for it."""
         cfg = self._cfg
 
         # Step 1 -- print-identity reset.
@@ -252,41 +269,23 @@ class DecisionEngine:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # None _apply_identity_reset(self, Optional[PrintState] print_state)
+    # Inputs: Optional[PrintState] print_state - the latest Moonraker print snapshot for this
+    #                                             tick, or None if unavailable
+    # Outputs: None
+    # Description: Step 1 of tick(). Resets all temporal accumulators (via self.reset()) only on
+    #              a POSITIVELY CONFIRMED change of print identity -- a genuinely different
+    #              non-None filename, or a confirmed transition out of PRINTING into a terminal
+    #              state (COMPLETE/CANCELLED/ERROR/STANDBY). Deliberately does NOT reset on
+    #              `print_state is None`, `state is UNKNOWN`, or `state is PAUSED`, since those
+    #              mean "state could not be determined" or "same job merely paused", not "the
+    #              print ended" -- see the full safety rationale in this method's docstring.
+    # Side Effects: May call self.reset(), wiping every temporal accumulator. Always mutates
+    #               self._prev_print_state to `print_state`.
     def _apply_identity_reset(self, print_state: Optional[PrintState]) -> None:
-        """Step 1: reset all temporal accumulators, but ONLY on a
-        positively-confirmed change of print identity -- never merely on an
-        inability to determine the current state.
-
-        `MoonrakerClient.get_print_state` is deliberately fail-closed: on
-        any transient failure (connection error, timeout, HTTP error,
-        malformed JSON) it returns `PrintState(state=UNKNOWN,
-        filename=None, ...)` rather than raising. On a Pi under print load,
-        such hiccups are not rare. If UNKNOWN were treated as "the print
-        ended" -- which its `filename=None` invites, since it also looks
-        like "the filename changed" -- a single flaky poll mid-print would
-        wipe every temporal accumulator (EMA, vote window, consecutive
-        counters). A genuine sustained failure whose evidence accumulates
-        more slowly than flaky polls arrive could then never earn enough
-        votes to fire: a missed detection, which is just as much a failure
-        of this system as a false positive.
-
-        So a reset now requires POSITIVE confirmation of a new identity:
-
-          * `prev.filename` and `print_state.filename` are both non-None
-            and differ (a genuinely different job), or
-          * `prev.state is PRINTING` and the new state is a confirmed
-            terminal state: COMPLETE, CANCELLED, ERROR, or STANDBY.
-
-        Everything else -- `print_state is None`, `state is UNKNOWN`, or
-        `state is PAUSED` -- means "we could not determine the state" or
-        "the same job is merely paused", not "the print ended", so
-        accumulators are PRESERVED. This is safe: `_gate_reason` already
-        returns `Action.NONE` with reason "not_printing" whenever
-        `print_state` is None or not PRINTING, so no action can ever fire
-        while the state is unconfirmed or paused -- preserving accumulators
-        here can only avoid discarding evidence, it can never cause a false
-        action.
-        """
+        # Resetting on UNKNOWN (Moonraker's fail-closed response to any transient
+        # error) would let a flaky poll wipe accumulators mid-print and block
+        # detection; only a positively-confirmed identity change resets.
         prev = self._prev_print_state
         should_reset = False
 
@@ -309,8 +308,17 @@ class DecisionEngine:
 
         self._prev_print_state = print_state
 
+    # Optional[str] _gate_reason(self, Optional[PrintState] print_state, GateResult quality)
+    # Inputs: Optional[PrintState] print_state - current Moonraker print snapshot, or None
+    #         GateResult quality - pre-inference quality gate outcome for the frame behind this
+    #                               tick
+    # Outputs: Optional[str] - a short machine-readable gate reason ("not_printing", "warmup", or
+    #                          "quality:<reason>") if this tick must not be scored, else None
+    # Description: Step 2 of tick(). Determines whether the current tick is even eligible to be
+    #              scored: the printer must be confirmed printing, past the configured warmup
+    #              period, and the frame must have passed the quality gate.
+    # Side Effects: None
     def _gate_reason(self, print_state: Optional[PrintState], quality: GateResult) -> Optional[str]:
-        """Step 2: return a gate reason if this tick must not be scored, else None."""
         cfg = self._cfg
         if print_state is None or not print_state.is_printing:
             return "not_printing"
@@ -320,9 +328,16 @@ class DecisionEngine:
             return f"quality:{quality.reason}"
         return None
 
+    # Action _clamp(Action action, DecisionConfig cfg)
+    # Inputs: Action action - the candidate pre-clamp action (PAUSE or CANCEL)
+    #         DecisionConfig cfg - carries the action_mode safety ceiling
+    # Outputs: Action - `action` downgraded to at most what `cfg.action_mode` permits (NOTIFY
+    #                   under NOTIFY_ONLY, PAUSE under PAUSE, unchanged under CANCEL)
+    # Description: Step 7 of tick(). Enforces the configured action_mode as a hard ceiling on
+    #              automated action, independent of the state machine's own transitions.
+    # Side Effects: None
     @staticmethod
     def _clamp(action: Action, cfg: DecisionConfig) -> Action:
-        """Step 7: clamp a candidate action down to the configured action_mode ceiling."""
         if cfg.action_mode is ActionMode.NOTIFY_ONLY:
             if action in (Action.PAUSE, Action.CANCEL):
                 return Action.NOTIFY

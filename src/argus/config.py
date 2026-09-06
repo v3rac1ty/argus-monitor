@@ -58,15 +58,10 @@ class CameraConfig:
 class DetectorConfig:
     """ONNX detector model, preprocessing, and per-class thresholds.
 
-    `kind` selects which `Detector` implementation `build_service` would
-    construct: `"detection"` (default) for the ONNX object detector
-    (`OnnxYoloDetector`, supporting both the legacy YOLOv8 raw-prediction
-    output contract and YOLO26's NMS-free end-to-end contract -- see
-    `layout`), or `"classification"` for a whole-frame ONNX classifier
-    (`ClassifierDetector`). `class_names` is the ordered class list matching
-    the model's output index order; it is required (must be non-empty) when
-    `kind == "classification"` since a classifier has no other way to know
-    what its output indices mean.
+    `kind` selects `OnnxYoloDetector` ("detection", default; see `layout` for
+    YOLOv8 vs YOLO26 end2end) or `ClassifierDetector` ("classification").
+    `class_names` gives the model's output index order and is required
+    (non-empty) for `kind == "classification"`.
     """
 
     kind: str = "detection"
@@ -164,9 +159,15 @@ class Config:
     storage: StorageConfig = field(default_factory=StorageConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
+    # Config from_yaml(cls, Union[str, Path] path)
+    # Inputs: Union[str, Path] path - filesystem path to a YAML config file
+    # Outputs: Config - a fully validated top-level configuration
+    # Description: Reads `path`, parses it as YAML, and delegates to `from_dict` for env
+    #              substitution, section construction, and validation.
+    # Side Effects: Reads a file from disk. Raises ConfigError on an unreadable file, malformed
+    #               YAML, or any validation failure (via from_dict).
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> Config:
-        """Load, parse, and validate a YAML config file."""
         path = Path(path)
         try:
             text = path.read_text(encoding="utf-8")
@@ -180,13 +181,17 @@ class Config:
             data = {}
         return cls.from_dict(data)
 
+    # Config from_dict(cls, dict d)
+    # Inputs: dict d - a plain, already-parsed config mapping (e.g. from yaml.safe_load)
+    # Outputs: Config - a fully validated top-level configuration
+    # Description: Applies `env:VAR_NAME` substitution to every string leaf, constructs each
+    #              section dataclass from the corresponding sub-mapping, and runs full
+    #              cross-field validation via `_validate`.
+    # Side Effects: Reads environment variables (os.environ) for any `env:VAR_NAME` reference.
+    #               Raises ConfigError if `d` is not a mapping, a section is malformed, or
+    #               validation fails.
     @classmethod
     def from_dict(cls, d: dict) -> Config:
-        """Build and validate a Config from a plain (already-parsed) dict.
-
-        Applies `env:VAR_NAME` substitution to every string leaf before
-        constructing section dataclasses, then runs full validation.
-        """
         if not isinstance(d, dict):
             raise ConfigError(f"config root must be a mapping, got {type(d).__name__}")
 
@@ -206,8 +211,13 @@ class Config:
         return config
 
 
+# Config load_config(Optional[Union[str, Path]] path=None)
+# Inputs: Optional[Union[str, Path]] path - config file to load; defaults to None, in which case
+#                                            DEFAULT_CONFIG_PATH (config.example.yaml) is used
+# Outputs: Config - a fully validated top-level configuration
+# Description: Thin wrapper around Config.from_yaml that supplies the default config path.
+# Side Effects: Reads a file from disk (via Config.from_yaml). Raises ConfigError on failure.
 def load_config(path: Optional[Union[str, Path]] = None) -> Config:
-    """Load a validated Config from `path`, or from config.example.yaml if omitted."""
     if path is None:
         path = DEFAULT_CONFIG_PATH
     return Config.from_yaml(path)
@@ -218,9 +228,14 @@ def load_config(path: Optional[Union[str, Path]] = None) -> Config:
 # --------------------------------------------------------------------------
 
 
+# Any _apply_env_overrides(Any value)
+# Inputs: Any value - a (possibly nested) dict/list/str/other value from parsed config YAML
+# Outputs: Any - `value` with every string of the exact form "env:VAR_NAME" replaced by
+#                os.environ["VAR_NAME"] (or None if unset); other values pass through unchanged
+# Description: Recursively walks dicts and lists, substituting environment-variable references
+#              (Argus's mechanism for keeping secrets like webhook URLs out of the config file).
+# Side Effects: Reads environment variables (os.environ.get) for each "env:VAR_NAME" match found.
 def _apply_env_overrides(value: Any) -> Any:
-    """Recursively replace any string of the exact form 'env:VAR_NAME' with
-    os.environ['VAR_NAME'] (or None if that variable is unset)."""
     if isinstance(value, dict):
         return {k: _apply_env_overrides(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -237,8 +252,17 @@ def _apply_env_overrides(value: Any) -> Any:
 # --------------------------------------------------------------------------
 
 
+# Any _build_section(Any data, type section_cls, str name)
+# Inputs: Any data - the raw sub-mapping for this section (or None if the section was omitted)
+#         type section_cls - the frozen dataclass to construct (e.g. CameraConfig)
+#         str name - the section's name in the config file, used in error messages
+# Outputs: Any - an instance of `section_cls`
+# Description: Generic constructor for config sections with no special-case field conversion:
+#              defaults to an empty mapping if `data` is None, rejects unknown keys, and
+#              instantiates `section_cls(**data)`.
+# Side Effects: Raises ConfigError if `data` is not a mapping, contains unknown keys, or fails to
+#               construct the dataclass (e.g. a missing/invalid required field).
 def _build_section(data: Any, section_cls: type, name: str) -> Any:
-    """Construct a simple section dataclass from a dict, rejecting unknown keys."""
     if data is None:
         data = {}
     if not isinstance(data, dict):
@@ -253,9 +277,16 @@ def _build_section(data: Any, section_cls: type, name: str) -> Any:
         raise ConfigError(f"invalid '{name}' section: {exc}") from exc
 
 
+# DetectorConfig _build_detector(Any data)
+# Inputs: Any data - the raw 'detector' sub-mapping (or None if omitted)
+# Outputs: DetectorConfig - a validated detector section instance
+# Description: Constructs DetectorConfig with field-specific conversions: `providers` and
+#              `class_names` to tuples, and `severity` values from plain strings to Severity enum
+#              members, rejecting unknown keys and invalid severity values along the way.
+# Side Effects: Raises ConfigError if `data` is not a mapping, contains unknown keys, has a
+#               non-mapping `severity`, contains an invalid severity value, or otherwise fails to
+#               construct the dataclass.
 def _build_detector(data: Any) -> DetectorConfig:
-    """Construct DetectorConfig, converting providers to a tuple and severity
-    values from plain strings to Severity enum members."""
     if data is None:
         data = {}
     if not isinstance(data, dict):
@@ -293,9 +324,14 @@ def _build_detector(data: Any) -> DetectorConfig:
         raise ConfigError(f"invalid 'detector' section: {exc}") from exc
 
 
+# DecisionConfig _build_decision(Any data)
+# Inputs: Any data - the raw 'decision' sub-mapping (or None if omitted)
+# Outputs: DecisionConfig - a validated decision section instance
+# Description: Constructs DecisionConfig, converting `action_mode` from a plain string to an
+#              ActionMode enum member, rejecting unknown keys and invalid action_mode values.
+# Side Effects: Raises ConfigError if `data` is not a mapping, contains unknown keys, has an
+#               invalid `action_mode` value, or otherwise fails to construct the dataclass.
 def _build_decision(data: Any) -> DecisionConfig:
-    """Construct DecisionConfig, converting action_mode from a plain string to
-    an ActionMode enum member."""
     if data is None:
         data = {}
     if not isinstance(data, dict):
@@ -326,14 +362,26 @@ def _build_decision(data: Any) -> DecisionConfig:
 # --------------------------------------------------------------------------
 
 
+# None _check_unit_interval(str name, float value)
+# Inputs: str name - dotted field name to use in the error message
+#         float value - the value to check
+# Outputs: None
+# Description: Validates that `value` lies in the closed interval [0, 1].
+# Side Effects: Raises ConfigError if `value` is out of range.
 def _check_unit_interval(name: str, value: float) -> None:
     if not (0.0 <= value <= 1.0):
         raise ConfigError(f"{name} must be in [0, 1], got {value}")
 
 
+# None _validate(Config config)
+# Inputs: Config config - the fully constructed (but not yet validated) top-level config
+# Outputs: None
+# Description: Validates every cross-field and range invariant across all sections (detector,
+#              decision, camera, quality, moonraker, notify, storage, logging), such as
+#              class_thresholds/severity key parity, score-threshold ordering
+#              (warn <= pause <= cancel), and every numeric range documented inline.
+# Side Effects: Raises ConfigError on the first violation found; otherwise none.
 def _validate(config: Config) -> None:
-    """Validate cross-field and range invariants. Raises ConfigError on the
-    first violation found."""
     det = config.detector
     d = config.decision
     cam = config.camera

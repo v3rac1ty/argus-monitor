@@ -1,31 +1,10 @@
-"""Build a clean, leak-free dataset at ``datasets/argus/`` from the raw
-Roboflow export at ``datasets/raw/`` (see ``training/ingest_dataset.py``).
+"""Builds a clean, leak-free dataset at ``datasets/argus/`` from the raw Roboflow export at ``datasets/raw/`` (see ``training/ingest_dataset.py``), fixing two defects in the raw archive.
 
-Fixes both known defects in the raw archive:
+Defect 1 (train/valid leakage): Roboflow generated 3 augmented variants per source photo and scattered them across train/valid (~47% overlap). This pools raw/train+valid, discards the shipped split, recovers each image's source identity from its ``.rf.<hex>`` suffix, and re-splits BY SOURCE -- never by file -- so all variants of one photo land in exactly one split. Val/test keep only the first variant per source (all 3 would triple eval cost and correlate errors); train keeps every variant.
 
-Defect 1 (train/valid leakage): Roboflow generated 3 augmented variants per
-source photo and scattered them across train/valid, so ~47% of the shipped
-validation set is material the model already trained on. This script pools
-every image from ``raw/train`` and ``raw/valid`` together, discards the
-shipped split entirely, recovers each image's *source identity* (the part of
-the filename before the Roboflow ``.rf.<hex>`` suffix), and re-splits by
-source -- never by file -- so all variants of one source photo land in
-exactly one of train/val/test.
+Defect 2 (missing ``test/``): the raw ``data.yaml`` points at a nonexistent ``test/`` dir; this generates a real held-out test split and writes a fresh ``data.yaml``.
 
-Defect 2 (missing ``test/`` dir): the raw ``data.yaml`` points at a
-``test/`` directory that was never included in the export. This script
-generates a real held-out test split (from sources never touched by
-train/val) and writes a fresh, correct ``data.yaml``.
-
-The train split keeps ALL variants of its sources (more training data). The
-val and test splits keep exactly ONE variant per source (deterministic:
-first in sorted filename order) -- evaluating on all 3 near-duplicate
-variants of one photo would triple eval cost, correlate errors between
-variants, and make the resulting precision/recall numbers less honest.
-
-Usage:
-    python training/prepare_dataset.py
-    python training/prepare_dataset.py --raw datasets/raw --out datasets/argus --seed 1337
+Usage: python training/prepare_dataset.py [--raw datasets/raw] [--out datasets/argus] [--seed 1337]
 """
 
 from __future__ import annotations
@@ -50,10 +29,8 @@ CLASS_NAMES: tuple[str, ...] = ("error extrusion", "spaghetti", "stringing", "wa
 
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png")
 
-# Matches Roboflow's "<source>.rf.<32-char-hex-ish>.<ext>" filenames, e.g.
-# "00001_error_dataset_jpeg.rf.549c891f051b38ac8300be431e761f8c.jpg".
-# Everything before ".rf." is the source identity; the hex chunk after it is
-# just the augmentation-variant id and is discarded.
+# Matches Roboflow's "<source>.rf.<hex>.<ext>" filenames; everything before ".rf." is the
+# source identity, the hex chunk is just the augmentation-variant id.
 SOURCE_ID_RE = re.compile(
     r"^(?P<src>.+)\.rf\.[0-9a-f]+\.(?:jpg|jpeg|png)$",
     re.IGNORECASE,
@@ -64,22 +41,22 @@ SPLIT_NAMES: tuple[str, str, str] = ("train", "val", "test")
 
 
 # --------------------------------------------------------------------------
-# Pure logic (unit-tested in tests/test_prepare_dataset.py without touching
-# the real dataset on disk)
+# Pure logic (unit-tested without touching the real dataset on disk)
 # --------------------------------------------------------------------------
 
 
+# tuple[str, bool] extract_source_id(str filename)
+# Inputs: str filename - an image filename from the raw Roboflow export
+# Outputs: tuple[str, bool] - (source_id, matched): source_id is the recovered source-photo
+#          identity; matched is True if the Roboflow ".rf.<hex>" suffix pattern was found,
+#          False if the whole filename stem was used as a fallback source id
+# Description: Recovers the source-photo identity from an image filename by stripping the
+#              Roboflow ".rf.<hex>" augmentation-variant suffix. This is the group/session unit
+#              used everywhere downstream: splitting happens BY SOURCE PHOTO, never by
+#              individual file, so all augmented variants of one photo land in exactly one
+#              split -- the guard against Defect 1 (train/valid leakage).
+# Side Effects: None (pure string parsing)
 def extract_source_id(filename: str) -> tuple[str, bool]:
-    """Recover the source-photo identity from an image filename.
-
-    Strips the Roboflow ``.rf.<hex>`` augmentation-variant suffix, e.g.
-    ``"00001_x.rf.549c89....jpg"`` -> ``"00001_x"``. If the filename doesn't
-    match that pattern, the whole stem (filename minus extension) is used as
-    its own source id instead, and ``matched`` is False so callers can count
-    how often this fallback fires.
-
-    Returns ``(source_id, matched)``.
-    """
     m = SOURCE_ID_RE.match(filename)
     if m:
         return m.group("src"), True
@@ -87,18 +64,18 @@ def extract_source_id(filename: str) -> tuple[str, bool]:
     return stem, False
 
 
+# tuple[dict[str, list[str]], int] group_by_source(Iterable[str] filenames)
+# Inputs: Iterable[str] filenames - image filenames to group
+# Outputs: tuple[dict[str, list[str]], int] - (groups, fallback_count): groups maps source id
+#          to a sorted list of filenames belonging to that source (all its augmentation
+#          variants); fallback_count is how many filenames didn't match the ".rf.<hex>" pattern
+# Description: Groups filenames by source-photo identity via extract_source_id. The grouping
+#              unit is the SOURCE PHOTO (session), not the individual file -- this is what lets
+#              callers split by source rather than by file. Filenames are sorted both across
+#              and within groups so downstream "first file for this source" selection is
+#              deterministic regardless of filesystem iteration order.
+# Side Effects: None
 def group_by_source(filenames: Iterable[str]) -> tuple[dict[str, list[str]], int]:
-    """Group filenames by source identity.
-
-    Returns ``(groups, fallback_count)`` where ``groups`` maps source id ->
-    sorted list of filenames belonging to that source (all its augmentation
-    variants), and ``fallback_count`` is how many filenames did not match the
-    ``.rf.<hex>`` pattern (see ``extract_source_id``).
-
-    Filenames are sorted (both across and within groups) so downstream
-    "first file for this source" selection is deterministic regardless of
-    filesystem iteration order.
-    """
     groups: dict[str, list[str]] = {}
     fallback_count = 0
     for fn in sorted(filenames):
@@ -109,19 +86,26 @@ def group_by_source(filenames: Iterable[str]) -> tuple[dict[str, list[str]], int
     return groups, fallback_count
 
 
+# tuple[list[str], list[str], list[str]] split_sources(Sequence[str] source_ids, int seed, tuple[float, float, float] ratios)
+# Inputs: Sequence[str] source_ids - source-photo identities to split (not individual files)
+#         int seed - RNG seed for deterministic shuffling, e.g. the CLI's default 1337
+#         tuple[float, float, float] ratios - (train, val, test) fractions, default
+#         DEFAULT_SPLIT_RATIOS = (0.70, 0.15, 0.15); must sum to 1.0
+# Outputs: tuple[list[str], list[str], list[str]] - (train_ids, val_ids, test_ids) source id
+#          lists; any rounding remainder is given to test so no source is invented or dropped
+# Description: Deterministically splits source ids (not individual files) into train/val/test.
+#              Splitting by SOURCE PHOTO/SESSION rather than by file is what guarantees no
+#              augmentation variant of a training-set photo can leak into val/test (the guard
+#              against Defect 1). Deterministic for a given seed: source ids are sorted first
+#              (so input order never matters), then shuffled with a seeded random.Random before
+#              slicing by ratio.
+# Side Effects: Raises ValueError if ratios don't sum to 1.0 (within 1e-6). Uses a locally-
+#               seeded random.Random(seed); does not touch global RNG state.
 def split_sources(
     source_ids: Sequence[str],
     seed: int,
     ratios: tuple[float, float, float] = DEFAULT_SPLIT_RATIOS,
 ) -> tuple[list[str], list[str], list[str]]:
-    """Deterministically split source ids into (train, val, test) lists.
-
-    Splits by SOURCE, never by file: this is what guarantees no augmentation
-    variant of a training-set photo can leak into val/test. Deterministic
-    for a given seed: sort the source ids first (so input order never
-    matters), then shuffle with a seeded ``random.Random`` before slicing by
-    ratio -- so the same seed always reproduces the same split.
-    """
     if abs(sum(ratios) - 1.0) > 1e-6:
         raise ValueError(f"split ratios must sum to 1.0, got {ratios!r} (sum={sum(ratios)})")
 
@@ -142,23 +126,24 @@ def split_sources(
     return train_ids, val_ids, test_ids
 
 
+# dict[str, list[str]] select_files_for_split(dict[str, list[str]] groups, Sequence[str] source_ids, str split)
+# Inputs: dict[str, list[str]] groups - source id -> sorted list of that source's filenames
+#         (from group_by_source)
+#         Sequence[str] source_ids - the sources assigned to this split (from split_sources)
+#         str split - "train", "val", or "test"
+# Outputs: dict[str, list[str]] - source id -> list of selected filenames for that source,
+#          restricted to source_ids
+# Description: Chooses which files, per source, belong in a given split. "train" keeps every
+#              augmentation variant of each of its sources (maximizes training data); "val" and
+#              "test" keep exactly one variant per source -- the first in sorted filename order
+#              -- because the near-duplicate variants would triple eval cost and correlate
+#              errors between variants if all were kept.
+# Side Effects: None
 def select_files_for_split(
     groups: dict[str, list[str]],
     source_ids: Sequence[str],
     split: str,
 ) -> dict[str, list[str]]:
-    """Choose which files, per source, belong in a given split.
-
-    ``train`` keeps every variant of each of its sources (maximizes training
-    data). ``val``/``test`` keep exactly one variant per source -- the first
-    in sorted filename order, i.e. ``groups[source][0]`` since
-    ``group_by_source`` already sorts each source's file list -- because the
-    3 variants are near-duplicates of one photo and evaluating on all of
-    them would triple eval cost and correlate errors between variants.
-
-    Returns a dict mapping source id -> list of selected filenames (for that
-    source), restricted to ``source_ids``.
-    """
     selected: dict[str, list[str]] = {}
     for sid in source_ids:
         files = groups[sid]
@@ -166,10 +151,15 @@ def select_files_for_split(
     return selected
 
 
+# None assert_no_source_overlap(dict[str, Sequence[str]] split_source_ids)
+# Inputs: dict[str, Sequence[str]] split_source_ids - split name -> source ids assigned to it
+# Outputs: None
+# Description: Verifies no source-photo identity appears in more than one split. This is the
+#              explicit check for the whole point of splitting by source instead of by file
+#              (the Defect 1 leakage guard), rather than just trusting split_sources.
+# Side Effects: Raises AssertionError naming the offending source and both splits it appears in,
+#               if any source-identity leakage is detected. No filesystem or RNG activity.
 def assert_no_source_overlap(split_source_ids: dict[str, Sequence[str]]) -> None:
-    """Raise ``AssertionError`` if any source id appears in more than one
-    split. This is the whole point of splitting by source instead of by
-    file, so it's checked explicitly rather than just trusted."""
     seen: dict[str, str] = {}
     for split_name, ids in split_source_ids.items():
         for sid in ids:
@@ -181,11 +171,15 @@ def assert_no_source_overlap(split_source_ids: dict[str, Sequence[str]]) -> None
             seen[sid] = split_name
 
 
+# list[int] parse_yolo_label_classes(str label_text)
+# Inputs: str label_text - contents of a YOLO-format label file
+# Outputs: list[int] - class id of every bounding-box line, in file order
+# Description: Parses a YOLO-format label file's contents and returns the class id of every
+#              bounding-box line (first whitespace-separated token per line). Blank lines are
+#              ignored; an empty/whitespace-only file legitimately means "no objects" and
+#              yields an empty list.
+# Side Effects: None (pure parsing)
 def parse_yolo_label_classes(label_text: str) -> list[int]:
-    """Parse a YOLO-format label file's contents and return the class id of
-    every bounding-box line (first whitespace-separated token per line).
-    Blank lines are ignored; an empty/whitespace-only file legitimately means
-    "no objects" and yields an empty list."""
     class_ids: list[int] = []
     for line in label_text.splitlines():
         line = line.strip()
@@ -196,17 +190,17 @@ def parse_yolo_label_classes(label_text: str) -> list[int]:
 
 
 # --------------------------------------------------------------------------
-# Label-row normalization: the raw export mixes YOLO *detection* rows
-# ("cls cx cy w h", 5 fields) with *segmentation/polygon* rows
-# ("cls x1 y1 x2 y2 ... xn yn", odd field count > 5). Ultralytics refuses any
-# label file that mixes the two formats and drops the WHOLE IMAGE, not just
-# the offending row. normalize_label_text() rewrites every row to plain
-# detection format so no image is lost to this.
+# Label-row normalization: rewrites every row to plain detection format, since
+# Ultralytics drops the WHOLE IMAGE for a label file mixing detection + polygon rows.
 # --------------------------------------------------------------------------
 
 
+# float clamp01(float value)
+# Inputs: float value - a normalized coordinate value
+# Outputs: float - value clamped to [0, 1]
+# Description: Clamps a normalized coordinate to the valid [0, 1] range.
+# Side Effects: None
 def clamp01(value: float) -> float:
-    """Clamp a normalized coordinate to the valid [0, 1] range."""
     return max(0.0, min(1.0, value))
 
 
@@ -218,19 +212,18 @@ class LabelNormalizeStats:
     contains_polygon_row: bool = False
 
 
+# tuple[int, list[float], list[float]] _row_corner_points(list[str] fields)
+# Inputs: list[str] fields - whitespace-split tokens of one YOLO label line (class id followed
+#         by either 4 detection fields or an odd-length list of polygon coordinates)
+# Outputs: tuple[int, list[float], list[float]] - (cls_id, xs, ys): the class id and the point
+#          list used to derive an axis-aligned bounding box
+# Description: Parses one label line's fields into (cls_id, xs, ys). A detection row (5 fields:
+#              cls cx cy w h) is converted to its two bounding corners so it can be run through
+#              the same clamp/bbox math as a polygon row. A segment row (odd field count > 5)
+#              uses its polygon points directly.
+# Side Effects: Raises ValueError if any field isn't numeric -- callers treat that as a
+#               malformed row (skip and count, don't crash). No I/O.
 def _row_corner_points(fields: list[str]) -> tuple[int, list[float], list[float]]:
-    """Parse one label line's whitespace-split ``fields`` into
-    ``(cls_id, xs, ys)`` -- the point list used to derive an axis-aligned
-    bounding box.
-
-    A detection row (5 fields: ``cls cx cy w h``) is converted to its two
-    bounding corners so it can be run through the exact same clamp/bbox math
-    as a polygon row. A segment row (odd field count > 5: ``cls x1 y1 x2 y2
-    ... xn yn``) uses its polygon points directly.
-
-    Raises ``ValueError`` if any field isn't numeric -- callers treat that as
-    a malformed row (skip and count, don't crash).
-    """
     cls_id = int(float(fields[0]))
     nums = [float(v) for v in fields[1:]]
     if len(fields) == 5:
@@ -243,28 +236,26 @@ def _row_corner_points(fields: list[str]) -> tuple[int, list[float], list[float]
     return cls_id, xs, ys
 
 
+# tuple[str, LabelNormalizeStats] normalize_label_text(str label_text)
+# Inputs: str label_text - raw contents of a YOLO label file (may mix detection and
+#         segmentation/polygon rows)
+# Outputs: tuple[str, LabelNormalizeStats] - (normalized_text, stats): normalized_text has
+#          every row rewritten to plain 5-field detection format (cls cx cy w h, 6 decimal
+#          places); stats tallies polygon_rows_converted, malformed_rows_skipped,
+#          degenerate_rows_dropped, and contains_polygon_row
+# Description: Rewrites every row of a YOLO label file to plain 5-field detection format. A
+#              5-field row is clamped and re-emitted (a no-op in meaning for well-formed
+#              input). A segment/polygon row (odd field count > 5) is clamped to [0, 1] and
+#              collapsed to its axis-aligned bounding box. Malformed rows (even field count > 5,
+#              fewer than 5 fields, or non-numeric fields) are skipped and counted rather than
+#              raised. A box that's degenerate after clamping (w <= 0 or h <= 0) is dropped
+#              silently. This exists because Ultralytics refuses any label file that mixes
+#              detection and segmentation rows and drops the WHOLE IMAGE, not just the
+#              offending row -- normalizing every row avoids losing images to that.
+# Side Effects: None (pure text transformation; no I/O)
 def normalize_label_text(label_text: str) -> tuple[str, LabelNormalizeStats]:
-    """Rewrite every row of a YOLO label file's contents to plain 5-field
-    detection format (``cls cx cy w h``), 6 decimal places.
-
-    - A 5-field row (``cls cx cy w h``) is treated as its two corner points,
-      clamped, and re-emitted -- a no-op in meaning for well-formed input.
-    - A row with an odd field count > 5 (``cls x1 y1 ... xn yn``) is a
-      segment/polygon row: its points are clamped to [0, 1] and collapsed to
-      the axis-aligned box ``cx=(min_x+max_x)/2, cy=(min_y+max_y)/2,
-      w=max_x-min_x, h=max_y-min_y``.
-    - A row with an even field count > 5 has an incomplete trailing
-      coordinate pair -- malformed; skipped and counted, not raised.
-    - A row with fewer than 5 fields, or any non-numeric field, is likewise
-      malformed; skipped and counted.
-    - A box that's degenerate after clamping (``w <= 0`` or ``h <= 0``) is
-      dropped silently (not counted as malformed -- it was a structurally
-      valid row that just clamps away to nothing).
-    - Blank lines are ignored (an empty file legitimately means "no
-      objects" and stays empty).
-
-    Returns ``(normalized_text, stats)``.
-    """
+    """A polygon row (odd field count > 5) is clamped and collapsed to its axis-aligned bbox;
+    an even field count > 5, <5 fields, or non-numeric fields are malformed (skipped, counted)."""
     stats = LabelNormalizeStats()
     out_lines: list[str] = []
 
@@ -319,14 +310,8 @@ def normalize_label_text(label_text: str) -> tuple[str, LabelNormalizeStats]:
 
 @dataclass(frozen=True)
 class ClassFilter:
-    """Which original class ids survive, and what they're remapped to.
-
-    ``keep_ids``: original (0..len(CLASS_NAMES)-1) class ids that survive.
-    ``id_remap``: original class id -> output class id. Rows whose class id
-        isn't a key here are dropped.
-    ``names``: output ``names`` list, indexed by output class id.
-    ``single_class``: whether all kept classes were collapsed to id 0.
-    """
+    """Which original class ids survive and what they're remapped to; rows whose class id
+    isn't a key in id_remap are dropped."""
 
     keep_ids: frozenset[int]
     id_remap: dict[int, int]
@@ -334,10 +319,16 @@ class ClassFilter:
     single_class: bool
 
 
+# ClassFilter default_class_filter(Sequence[str] class_names)
+# Inputs: Sequence[str] class_names - full class-name list, default CLASS_NAMES (the canonical
+#         5 classes: error extrusion, spaghetti, stringing, warping, zits)
+# Outputs: ClassFilter - identity filter: keeps every class id, maps each to itself, and uses
+#          class_names as-is (single_class=False)
+# Description: Builds the identity ClassFilter (keep every class, no remap, no collapsing).
+#              Used when --classes/--single-class aren't passed, so downstream code has a
+#              single code path regardless of whether filtering is active.
+# Side Effects: None
 def default_class_filter(class_names: Sequence[str] = CLASS_NAMES) -> ClassFilter:
-    """Identity filter: keep every class, no remap, no collapsing. Used when
-    ``--classes``/``--single-class`` aren't passed, so downstream code has a
-    single code path regardless of whether filtering is active."""
     ids = range(len(class_names))
     return ClassFilter(
         keep_ids=frozenset(ids),
@@ -347,24 +338,25 @@ def default_class_filter(class_names: Sequence[str] = CLASS_NAMES) -> ClassFilte
     )
 
 
+# ClassFilter resolve_class_filter(Sequence[str] | None classes, bool single_class, Sequence[str] class_names)
+# Inputs: Sequence[str] | None classes - requested class names from --classes, or None/empty to
+#         keep every class
+#         bool single_class - whether to collapse all kept classes into output id 0
+#         Sequence[str] class_names - full class-name list, default CLASS_NAMES
+# Outputs: ClassFilter - keep_ids, id_remap (original id -> output id), output names list
+#          (joined with "+" if single_class), and the single_class flag
+# Description: Builds the class-id remap for --classes/--single-class. Requested names are
+#              matched against class_names case-insensitively. Kept ids are always ordered by
+#              their ORIGINAL id (not CLI order), so "--classes warping,spaghetti" and
+#              "--classes spaghetti,warping" produce the same remap. Without single_class, kept
+#              ids are remapped to a contiguous 0..k-1 range in original-id order.
+# Side Effects: Raises ValueError for an unknown class name in --classes, or if --classes
+#               resolves to no valid names. No I/O.
 def resolve_class_filter(
     classes: Sequence[str] | None,
     single_class: bool,
     class_names: Sequence[str] = CLASS_NAMES,
 ) -> ClassFilter:
-    """Build the class-id remap for ``--classes``/``--single-class``.
-
-    ``classes=None`` (or empty) means "keep every class". Requested names are
-    matched against ``class_names`` case-insensitively; an unknown name
-    raises ``ValueError``. Kept ids are always ordered by their ORIGINAL id
-    (not CLI order), so e.g. ``--classes warping,spaghetti`` and
-    ``--classes spaghetti,warping`` produce the same remap.
-
-    If ``single_class`` is set, every kept id maps to output id 0 and the
-    output ``names`` list is a single entry joining the kept names with
-    ``"+"``. Otherwise kept ids are remapped to a contiguous ``0..k-1``
-    range in original-id order.
-    """
     if classes:
         lower_to_id = {name.lower(): i for i, name in enumerate(class_names)}
         requested_ids: set[int] = set()
@@ -393,14 +385,18 @@ def resolve_class_filter(
     return ClassFilter(keep_ids=keep_ids, id_remap=id_remap, names=names, single_class=single_class)
 
 
+# str apply_class_filter(str label_text, ClassFilter class_filter)
+# Inputs: str label_text - normalized label text (5-field detection rows, see
+#         normalize_label_text)
+#         ClassFilter class_filter - the class keep/remap rules to apply
+# Outputs: str - label text with dropped/unkept rows removed and surviving rows' class ids
+#          remapped per class_filter.id_remap; "" if no rows survive
+# Description: Drops rows whose class isn't kept by class_filter and remaps surviving rows'
+#              class id per class_filter.id_remap. Assumes label_text is already normalized to
+#              5-field detection rows; non-numeric or otherwise unparseable leading tokens are
+#              dropped defensively rather than raising.
+# Side Effects: None (pure text transformation; no I/O)
 def apply_class_filter(label_text: str, class_filter: ClassFilter) -> str:
-    """Drop rows whose class isn't kept by ``class_filter`` and remap
-    surviving rows' class id per ``class_filter.id_remap``.
-
-    Assumes ``label_text`` is already normalized to 5-field detection rows
-    (see ``normalize_label_text``); non-numeric or otherwise unparseable
-    leading tokens are dropped defensively rather than raising.
-    """
     out_lines: list[str] = []
     for raw_line in label_text.splitlines():
         line = raw_line.strip()
@@ -430,9 +426,17 @@ class RawImage:
     label_path: Path  # may or may not exist on disk
 
 
+# list[RawImage] scan_raw_split(Path raw_root, str raw_split_dir)
+# Inputs: Path raw_root - root of the extracted raw Roboflow dataset (datasets/raw/)
+#         str raw_split_dir - the shipped split subdirectory to scan, "train" or "valid"
+# Outputs: list[RawImage] - one RawImage per image file found, paired with its expected
+#          (possibly nonexistent) label path
+# Description: Lists every image in raw_root/raw_split_dir/images, paired with its expected
+#              label path in raw_root/raw_split_dir/labels (which may not exist on disk).
+# Side Effects: Raises FileNotFoundError if the expected images/ directory doesn't exist
+#               (pointing the user at training/ingest_dataset.py). Read-only filesystem
+#               traversal otherwise.
 def scan_raw_split(raw_root: Path, raw_split_dir: str) -> list[RawImage]:
-    """List every image in ``raw_root/raw_split_dir/images`` (e.g. 'train' or
-    'valid'), paired with its expected label path (which may not exist)."""
     images_dir = raw_root / raw_split_dir / "images"
     labels_dir = raw_root / raw_split_dir / "labels"
     if not images_dir.is_dir():
@@ -447,21 +451,20 @@ def scan_raw_split(raw_root: Path, raw_split_dir: str) -> list[RawImage]:
     return out
 
 
+# tuple[dict[str, RawImage], int] pool_raw_images(Path raw_root)
+# Inputs: Path raw_root - root of the extracted raw Roboflow dataset (datasets/raw/)
+# Outputs: tuple[dict[str, RawImage], int] - (pooled, duplicate_count): pooled maps filename to
+#          RawImage across both shipped splits; duplicate_count is how many filenames appeared
+#          in both raw split dirs (first occurrence, train, wins)
+# Description: Pools images from raw/train and raw/valid into a single filename -> RawImage
+#              map, discarding the shipped train/valid split entirely (Defect 1: Roboflow's
+#              shipped split leaked augmented variants of the same source photo across
+#              train/valid). A raw split subdirectory that doesn't exist at all is skipped
+#              rather than treated as an error, so this stays usable on synthetic test fixtures
+#              that only populate one of the two.
+# Side Effects: Read-only filesystem traversal via scan_raw_split; raises FileNotFoundError if
+#               a split subdirectory exists but its images/ folder is missing.
 def pool_raw_images(raw_root: Path) -> tuple[dict[str, RawImage], int]:
-    """Pool images from raw/train and raw/valid into a single filename ->
-    RawImage map (the shipped split is discarded here per Defect 1).
-
-    A raw split subdirectory (e.g. ``raw_root/valid``) that doesn't exist at
-    all is skipped rather than treated as an error -- this keeps the
-    function usable on small synthetic fixtures (e.g. in tests) that only
-    populate one of the two. If the subdirectory exists but its ``images``
-    folder is missing, that's a malformed extraction and still raises (via
-    ``scan_raw_split``).
-
-    Returns ``(pooled, duplicate_count)``; if the same filename somehow shows
-    up in both raw split dirs, the first occurrence (train, scanned first)
-    wins and the duplicate is dropped and counted.
-    """
     pooled: dict[str, RawImage] = {}
     duplicates = 0
     for raw_split_dir in ("train", "valid"):
@@ -487,12 +490,25 @@ class SplitStats:
     instances_per_class: dict[str, int] = field(default_factory=dict)
     images_per_class: dict[str, int] = field(default_factory=dict)
 
+    # None __post_init__()
+    # Inputs: None (operates on self; class_names, instances_per_class, images_per_class)
+    # Outputs: None
+    # Description: Dataclass post-init hook that fills instances_per_class and
+    #              images_per_class with zero counts for every class in class_names, when the
+    #              caller didn't supply them explicitly.
+    # Side Effects: Mutates self.instances_per_class and self.images_per_class in place.
     def __post_init__(self) -> None:
         if not self.instances_per_class:
             self.instances_per_class = {c: 0 for c in self.class_names}
         if not self.images_per_class:
             self.images_per_class = {c: 0 for c in self.class_names}
 
+    # dict[str, object] to_dict()
+    # Inputs: None (operates on self)
+    # Outputs: dict[str, object] - JSON-serializable view of every field on this SplitStats
+    # Description: Converts this SplitStats instance into a plain dict for JSON serialization
+    #              into split_report.json.
+    # Side Effects: None
     def to_dict(self) -> dict[str, object]:
         return {
             "n_sources": self.n_sources,
@@ -506,6 +522,27 @@ class SplitStats:
         }
 
 
+# SplitStats materialize_split(str split, dict[str, list[str]] selected, dict[str, RawImage] pooled, Path out_dir, ClassFilter | None class_filter)
+# Inputs: str split - split name, "train", "val", or "test"
+#         dict[str, list[str]] selected - source id -> filenames to materialize for this split
+#         (from select_files_for_split)
+#         dict[str, RawImage] pooled - filename -> RawImage lookup (from pool_raw_images)
+#         Path out_dir - output dataset root (e.g. datasets/argus)
+#         ClassFilter | None class_filter - class keep/remap rules, default None (uses
+#         default_class_filter(), i.e. keep everything)
+# Outputs: SplitStats - tallies of sources, images, missing labels, polygon conversions,
+#          malformed rows, and per-class instance/image counts for this split
+# Description: Copies the chosen images (and matching labels, when present) for one split into
+#              out_dir/<split>/{images,labels} and tallies stats. Every label file is
+#              normalized to plain detection rows (normalize_label_text) so polygon/segment
+#              rows survive instead of the whole image being dropped by Ultralytics. If
+#              class_filter is given, rows are then filtered/remapped through it; images left
+#              with zero surviving labels are still kept as legitimate background/negative
+#              images.
+# Side Effects: Creates out_dir/<split>/images and out_dir/<split>/labels directories; copies
+#               image files (shutil.copy2) into images_out; reads each label file from disk and
+#               writes the normalized/filtered label text to labels_out; prints a WARNING to
+#               stdout for images with no label file and for labels with out-of-range class ids.
 def materialize_split(
     split: str,
     selected: dict[str, list[str]],
@@ -513,16 +550,6 @@ def materialize_split(
     out_dir: Path,
     class_filter: ClassFilter | None = None,
 ) -> SplitStats:
-    """Copy the chosen images (+ matching labels, when present) for one
-    split into ``out_dir/<split>/{images,labels}`` and tally stats.
-
-    Every label file is normalized to plain detection rows (see
-    ``normalize_label_text``) so polygon/segment rows in the source data
-    survive instead of getting the whole image dropped by Ultralytics. If
-    ``class_filter`` is given, rows are then filtered/remapped through it
-    (see ``apply_class_filter``); images left with zero surviving labels are
-    still kept -- they become legitimate background/negative images.
-    """
     cf = class_filter if class_filter is not None else default_class_filter()
 
     images_out = out_dir / split / "images"
@@ -573,11 +600,16 @@ def materialize_split(
     return stats
 
 
+# Path write_data_yaml(Path out_dir, Sequence[str] class_names)
+# Inputs: Path out_dir - output dataset root (e.g. datasets/argus)
+#         Sequence[str] class_names - active class name order, default CLASS_NAMES (the
+#         canonical 5), or narrowed by --classes/--single-class
+# Outputs: Path - path to the written data.yaml file
+# Description: Writes out_dir/data.yaml with correct train/val/test paths (fixing Defect 2: the
+#              raw data.yaml pointed at a test/ dir that didn't exist) and the active class name
+#              order.
+# Side Effects: Writes (overwrites) out_dir/data.yaml on disk.
 def write_data_yaml(out_dir: Path, class_names: Sequence[str] = CLASS_NAMES) -> Path:
-    """Write datasets/argus/data.yaml with correct train/val/test paths
-    (fixing Defect 2: the raw data.yaml pointed at a test/ dir that didn't
-    exist) and the active class name order (the canonical 5 classes, unless
-    narrowed by --classes/--single-class)."""
     data_yaml_path = out_dir / "data.yaml"
     names_literal = ", ".join(f"'{c}'" for c in class_names)
     content = (
@@ -599,6 +631,14 @@ def write_data_yaml(out_dir: Path, class_names: Sequence[str] = CLASS_NAMES) -> 
 # --------------------------------------------------------------------------
 
 
+# argparse.Namespace parse_args(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: argparse.Namespace - parsed options (raw, out, seed, train/val/test-ratio, force,
+#          classes, single_class). Notable defaults: --seed 1337, ratios DEFAULT_SPLIT_RATIOS
+#          (0.70, 0.15, 0.15).
+# Description: Defines and parses the CLI for building the leak-free dataset.
+# Side Effects: None (argparse may print usage/help and call sys.exit on bad input, but no
+#               filesystem or network activity)
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--raw", type=Path, default=DEFAULT_RAW_DIR, help=f"Raw extracted dataset dir (default: {DEFAULT_RAW_DIR})")
@@ -629,6 +669,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# None main(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: None
+# Description: CLI entry point. Resolves the class filter, pools raw/train+raw/valid images
+#              (discarding the shipped split), groups them by source-photo identity, splits
+#              sources deterministically into train/val/test, verifies zero source overlap
+#              (both from the in-memory split and by re-scanning what was actually written to
+#              disk), materializes each split's images/labels, writes data.yaml and
+#              split_report.json, and prints a full summary report.
+# Side Effects: Optionally wipes out_dir with shutil.rmtree when --force is passed; creates
+#               out_dir and its split subdirectories; copies image files and writes normalized
+#               label files to disk (via materialize_split); writes out_dir/data.yaml (via
+#               write_data_yaml) and out_dir/split_report.json; calls sys.exit on an invalid
+#               --classes value; prints progress and the full split report to stdout.
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     raw_dir: Path = args.raw

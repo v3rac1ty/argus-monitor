@@ -1,29 +1,8 @@
-"""Evaluate a trained checkpoint on the held-out TEST split and quantify the
-false-positive rate the OVERRIDING REQUIREMENT cares about.
+"""Evaluates a trained checkpoint on the held-out TEST split (untouched by training/threshold selection, unlike the original archive's leaky train/valid split). Per class: precision/recall/AP50 at max-F1, a confidence-threshold sweep, and the lowest threshold reaching ``--target-precision`` (default 0.95). ``spaghetti``/``warping`` are CATASTROPHIC -- the only classes allowed to stop a print, so their precision at the chosen threshold is the real false-positive rate.
 
-The test split (built by training/prepare_dataset.py) is untouched by
-training and by any threshold selection here, so these numbers are the
-honest ones -- not the inflated ones you'd get from the original archive's
-leaky train/valid split.
+``--min-recall`` rejects Ultralytics' precision=1.0-at-zero-predictions convention: a class that never fires can't be a false positive but also can't catch a real failure, so that's not a usable operating point.
 
-For each class this reports:
-  - precision/recall/AP50 at the model's own max-F1 operating point
-  - a confidence-threshold sweep (precision & recall at each step)
-  - the LOWEST confidence threshold that achieves precision >= --target-precision
-    (default 0.95), or an explicit "not reachable" if no threshold does
-
-`spaghetti` and `warping` are flagged as CATASTROPHIC: these are the two
-classes allowed to stop a print, so their precision at the chosen threshold
-is what actually determines how often a real print gets killed for nothing.
-
-All of this is computed once via a single low-confidence model.val() pass
-(conf=0.001) using Ultralytics' own IoU=0.5 precision/recall-vs-confidence
-curves (ap_per_class), not re-implemented matching logic -- so the numbers
-match what Ultralytics would report at any single operating point.
-
-Usage:
-    python training/evaluate.py --weights runs/train/argus_yolov8n/weights/best.pt
-    python training/evaluate.py --weights ... --target-precision 0.95 --device 0
+Usage: python training/evaluate.py --weights runs/train/argus_yolov8n/weights/best.pt [--target-precision 0.95]
 """
 
 from __future__ import annotations
@@ -42,6 +21,16 @@ DEFAULT_OUT_PATH = REPO_ROOT / "runs" / "evaluation.json"
 CATASTROPHIC_CLASSES = ("spaghetti", "warping")
 
 
+# argparse.Namespace parse_args(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: argparse.Namespace - parsed evaluation options (weights, data, imgsz, batch, device,
+#          nms_iou, target_precision, min_recall, sweep_start/end/step, out). Notable defaults:
+#          --target-precision 0.95, --min-recall 0.05 (the vacuous-precision floor: rejects
+#          thresholds that only "achieve" target precision via Ultralytics' precision=1.0
+#          convention for zero surviving predictions), --nms-iou 0.7.
+# Description: Defines and parses the CLI for evaluating a detection checkpoint on the test split.
+# Side Effects: None (argparse may print usage/help and call sys.exit on bad input, but no
+#               filesystem or network activity)
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--weights", type=Path, required=True, help="Path to trained best.pt")
@@ -71,9 +60,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# Any run_validation(Path weights, Path data, int imgsz, int batch, str device, float nms_iou)
+# Inputs: Path weights - path to the trained best.pt checkpoint
+#         Path data - path to data.yaml describing the dataset (including its "test" split)
+#         int imgsz - validation image size
+#         int batch - validation batch size
+#         str device - CUDA device index, list, or "cpu"
+#         float nms_iou - IoU threshold used for NMS during validation
+# Outputs: Any - the Ultralytics DetMetrics object returned by model.val(), carrying the full
+#          precision/recall-vs-confidence curves used by the rest of this module
+# Description: Runs Ultralytics val() on the TEST split (held out from training and threshold
+#              selection) at low confidence (conf=0.001) so the full precision/recall-vs-
+#              confidence curve is available afterward, using Ultralytics' own IoU=0.5
+#              ap_per_class matching rather than reimplemented logic.
+# Side Effects: Imports ultralytics.YOLO lazily; loads the checkpoint into memory; runs a full
+#               GPU/CPU inference pass over the test split (plots=False, save_json=False, so no
+#               files are written by this call itself).
 def run_validation(weights: Path, data: Path, imgsz: int, batch: int, device: str, nms_iou: float):
-    """Run Ultralytics val() on the TEST split at low confidence (0.001) so
-    the full precision/recall-vs-confidence curve is available afterward."""
     from ultralytics import YOLO
 
     model = YOLO(str(weights))
@@ -92,11 +95,39 @@ def run_validation(weights: Path, data: Path, imgsz: int, batch: int, device: st
     return metrics
 
 
+# list[float] sweep_thresholds(float start, float end, float step)
+# Inputs: float start - first confidence threshold in the sweep
+#         float end - last confidence threshold in the sweep (inclusive)
+#         float step - increment between thresholds
+# Outputs: list[float] - confidence thresholds from start to end (inclusive) in steps of step,
+#          rounded to 10 decimal places to avoid float accumulation artifacts
+# Description: Builds the list of confidence thresholds used for the per-class sweep table.
+# Side Effects: None
 def sweep_thresholds(start: float, end: float, step: float) -> list[float]:
     n_steps = int(round((end - start) / step)) + 1
     return [round(start + i * step, 10) for i in range(n_steps) if start + i * step <= end + 1e-9]
 
 
+# tuple[Optional[dict[str, float]], Optional[dict[str, float]]] find_lowest_threshold_for_precision(np.ndarray px, np.ndarray p_curve, np.ndarray r_curve, float target_precision, float min_recall)
+# Inputs: np.ndarray px - confidence values (x-axis) for the precision/recall curves
+#         np.ndarray p_curve - precision at each confidence value in px, for one class
+#         np.ndarray r_curve - recall at each confidence value in px, for one class
+#         float target_precision - minimum precision a threshold must reach
+#         float min_recall - minimum recall a threshold must also reach, to reject
+#         Ultralytics' vacuous precision=1.0-at-zero-predictions convention
+# Outputs: tuple[Optional[dict[str, float]], Optional[dict[str, float]]] - (result,
+#          vacuous_example): result is {"threshold", "precision", "recall"} for the first
+#          (lowest) threshold meeting both target_precision and min_recall, or None if none do;
+#          vacuous_example is set (only when result is None) to the first point that met
+#          target_precision but not min_recall, so callers can report why nothing was accepted.
+# Description: Scans confidence thresholds ascending and returns the first (lowest) one whose
+#              precision meets target_precision AND whose recall is at least min_recall. The
+#              min_recall floor exists because Ultralytics' precision curve reports precision=1.0
+#              by convention wherever zero predictions survive for a class at that confidence (a
+#              vacuous 0/0-style "perfect" score) -- a detector that never fires can't be a false
+#              positive, but it also can't ever catch a real failure, so this floor rejects that
+#              statistically meaningless operating point.
+# Side Effects: None (pure numeric scan)
 def find_lowest_threshold_for_precision(
     px: np.ndarray,
     p_curve: np.ndarray,
@@ -104,28 +135,9 @@ def find_lowest_threshold_for_precision(
     target_precision: float,
     min_recall: float,
 ) -> tuple[Optional[dict[str, float]], Optional[dict[str, float]]]:
-    """Scan confidence thresholds ascending and return the first (lowest) one
-    whose precision meets `target_precision` AND whose recall is at least
-    `min_recall`, paired with the recall at that same threshold.
-
-    The `min_recall` floor matters: Ultralytics' precision curve reports
-    precision=1.0 by convention wherever zero predictions survive for a
-    class at that confidence (a vacuous 0/0-style "perfect" score -- see
-    `ap_per_class`'s `left=1` fill). Without this floor, a barely-trained or
-    poorly-performing class can "achieve" the target precision purely by
-    never firing at all, which is a statistically meaningless operating
-    point (a detector that never fires can't ever be a false positive, but
-    it also can't ever catch a real failure -- exactly the kind of
-    inflated-looking-but-dishonest number this project explicitly wants to
-    avoid).
-
-    Returns `(result, vacuous_example)`:
-      - `result` is the first point meeting both conditions, or None.
-      - `vacuous_example` is set (only when `result` is None) to the first
-        point that met `target_precision` but NOT `min_recall`, so callers
-        can report *why* it wasn't accepted rather than silently saying
-        "unreachable".
-    """
+    """`min_recall` rejects Ultralytics' precision=1.0-at-zero-predictions convention (see
+    ap_per_class's left=1 fill) -- a class that never fires can't be a false positive but also
+    can't catch a real failure."""
     idxs = np.argsort(px)  # px is already ascending (linspace) but be defensive
     vacuous_example: Optional[dict[str, float]] = None
     for i in idxs:
@@ -137,19 +149,39 @@ def find_lowest_threshold_for_precision(
     return None, vacuous_example
 
 
+# dict best_supported_point(list[dict] sweep, float min_recall)
+# Inputs: list[dict] sweep - per-threshold {"threshold", "precision", "recall"} dicts for one
+#         class, from build_report's confidence sweep
+#         float min_recall - the recall floor a sweep point must clear to count as "supported"
+# Outputs: dict - the chosen sweep point ({"threshold", "precision", "recall"})
+# Description: Picks the highest-precision sweep point that still clears min_recall (i.e.
+#              backed by a meaningful number of real detections, not the vacuous
+#              0-predictions/precision=1.0 artifact). Falls back to the single highest-recall
+#              point if the class never clears min_recall anywhere in the sweep.
+# Side Effects: None
 def best_supported_point(sweep: list[dict], min_recall: float) -> dict:
-    """Pick the highest-precision sweep point that still clears `min_recall`
-    (i.e. backed by a meaningful number of real detections, not the vacuous
-    0-predictions/precision=1.0 artifact). Falls back to the single
-    highest-recall point if the class never clears `min_recall` anywhere in
-    the sweep -- i.e. the class is effectively non-functional at every
-    threshold tried."""
     supported = [pt for pt in sweep if pt["recall"] >= min_recall]
     if supported:
         return max(supported, key=lambda pt: pt["precision"])
     return max(sweep, key=lambda pt: pt["recall"])
 
 
+# dict build_report(Any metrics, tuple[str, ...] class_names, argparse.Namespace args)
+# Inputs: Any metrics - the Ultralytics DetMetrics object returned by run_validation
+#         tuple[str, ...] class_names - full class-name list from data.yaml, in config order
+#         argparse.Namespace args - parsed CLI args (target_precision, min_recall, sweep
+#         bounds, weights, data paths, etc.)
+# Outputs: dict - full JSON-serializable evaluation report: overall mAP/precision/recall,
+#          per-class metrics (AP50, AP50-95, precision/recall at max-F1, the confidence sweep,
+#          the lowest threshold reaching target_precision or an explicit vacuous/unreachable
+#          marker, and an is_catastrophic flag), classes with no test instances, and the
+#          catastrophic-class list
+# Description: Builds the full per-class and overall evaluation report from Ultralytics'
+#              validation metrics, running the confidence sweep and the min_recall-guarded
+#              target-precision search (find_lowest_threshold_for_precision) for each class
+#              that had test instances. spaghetti/warping are flagged CATASTROPHIC since they
+#              are the only classes allowed to stop a print.
+# Side Effects: None (pure computation over the metrics object; no I/O)
 def build_report(metrics, class_names: tuple[str, ...], args: argparse.Namespace) -> dict:
     box = metrics.box
     names: dict[int, str] = metrics.names  # {idx: name}, full class set from data.yaml
@@ -219,6 +251,16 @@ def build_report(metrics, class_names: tuple[str, ...], args: argparse.Namespace
     return report
 
 
+# str format_yaml_block(dict report, tuple[str, ...] class_names)
+# Inputs: dict report - evaluation report produced by build_report
+#         tuple[str, ...] class_names - full class-name list from data.yaml, in config order
+# Outputs: str - a "class_thresholds:" YAML block ready to paste into config.example.yaml /
+#          config.yaml, with inline comments explaining each recommended threshold, including
+#          loud warnings when target precision is only vacuously reachable or not reachable at
+#          all (falling back to best_supported_point in those cases)
+# Description: Formats the per-class recommended confidence thresholds as a pasteable YAML
+#              block for the runtime config.
+# Side Effects: None (pure string formatting)
 def format_yaml_block(report: dict, class_names: tuple[str, ...]) -> str:
     lines = ["class_thresholds:"]
     for cname in class_names:
@@ -236,13 +278,8 @@ def format_yaml_block(report: dict, class_names: tuple[str, ...]) -> str:
                 f"(target precision {target:.2f} MET)"
             )
         elif entry["vacuous_precision_only"] is not None:
-            # Target precision is only "met" where the model made essentially no
-            # predictions at all (recall < --min-recall) -- Ultralytics reports
-            # precision=1.0 by convention for 0 surviving predictions. That's a
-            # statistically meaningless number, not a usable threshold: a detector
-            # that never fires can't be a false positive, but it also can't ever
-            # catch a real failure. Recommend the best REAL (recall-backed) point
-            # instead and say so loudly.
+            # Only "met" via Ultralytics' precision=1.0-at-zero-predictions convention;
+            # recommend the best real (recall-backed) point instead.
             v = entry["vacuous_precision_only"]
             best_p = best_supported_point(entry["confidence_sweep"], report["min_recall"])
             lines.append(
@@ -268,6 +305,15 @@ def format_yaml_block(report: dict, class_names: tuple[str, ...]) -> str:
     return "\n".join(lines)
 
 
+# None print_report(dict report, tuple[str, ...] class_names)
+# Inputs: dict report - evaluation report produced by build_report
+#         tuple[str, ...] class_names - full class-name list from data.yaml, in config order
+# Outputs: None
+# Description: Prints the human-readable evaluation summary to stdout: overall mAP, a per-class
+#              metrics table (tagging catastrophic classes), the recommended confidence
+#              threshold per class with vacuous/unreachable warnings, and the pasteable YAML
+#              block from format_yaml_block.
+# Side Effects: Prints the full evaluation report to stdout. No filesystem writes.
 def print_report(report: dict, class_names: tuple[str, ...]) -> None:
     print()
     print("=" * 78)
@@ -337,6 +383,16 @@ def print_report(report: dict, class_names: tuple[str, ...]) -> None:
     print("=" * 78)
 
 
+# None main(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: None
+# Description: CLI entry point. Loads class names from data.yaml, runs validation on the test
+#              split, builds the evaluation report, prints it, and writes the full JSON report
+#              to disk.
+# Side Effects: Raises FileNotFoundError if --weights or --data don't exist; reads and parses
+#               the data.yaml file; runs a full GPU/CPU validation pass (see run_validation);
+#               prints the evaluation report to stdout; creates --out's parent directory and
+#               writes the full JSON report to --out (default runs/evaluation.json).
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 

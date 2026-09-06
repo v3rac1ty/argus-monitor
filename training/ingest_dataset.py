@@ -26,23 +26,39 @@ DEFAULT_OUTPUT = REPO_ROOT / "datasets" / "raw"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 
+# bool is_already_extracted(Path output_dir)
+# Inputs: Path output_dir - directory to check for a prior extraction
+# Outputs: bool - True if output_dir already contains a Roboflow data.yaml manifest
+# Description: Best-effort check for whether the archive has already been extracted into
+#              output_dir, used to make extraction idempotent.
+# Side Effects: None (read-only filesystem check)
 def is_already_extracted(output_dir: Path) -> bool:
-    """Best-effort check for whether the archive has already been extracted
-    into ``output_dir`` (looks for the Roboflow ``data.yaml`` manifest)."""
     return (output_dir / "data.yaml").is_file()
 
 
+# None extract_archive(Path archive_path, Path output_dir)
+# Inputs: Path archive_path - path to the Roboflow YOLOv8 zip export
+#         Path output_dir - directory to extract the archive into
+# Outputs: None
+# Description: Extracts every entry in the zip archive at archive_path into output_dir,
+#              creating it if needed.
+# Side Effects: Creates output_dir (and parents) if missing; extracts all files from the
+#               zip archive onto disk under output_dir.
 def extract_archive(archive_path: Path, output_dir: Path) -> None:
-    """Extract every entry in the zip archive at ``archive_path`` into
-    ``output_dir``, creating it if needed."""
     output_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive_path) as zf:
         zf.extractall(output_dir)
 
 
+# dict[str, object] summarize(Path output_dir)
+# Inputs: Path output_dir - root of the extracted dataset tree to walk
+# Outputs: dict[str, object] - "top_level_files" (sorted file names at the root) and
+#          "splits" (per top-level split directory: image count, label count, and a
+#          per-extension image breakdown)
+# Description: Walks the extracted tree and counts images/labels per top-level split
+#              directory, for the human-readable summary printed after extraction.
+# Side Effects: None (read-only filesystem traversal)
 def summarize(output_dir: Path) -> dict[str, object]:
-    """Walk the extracted tree and count images/labels per top-level split
-    directory, for the human-readable summary printed after extraction."""
     summary: dict[str, object] = {}
     top_level_files = sorted(p.name for p in output_dir.iterdir() if p.is_file())
     summary["top_level_files"] = top_level_files
@@ -70,6 +86,12 @@ def summarize(output_dir: Path) -> dict[str, object]:
     return summary
 
 
+# argparse.Namespace parse_args(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: argparse.Namespace - parsed --archive, --output, and --force values
+# Description: Defines and parses the CLI arguments for this ingest script.
+# Side Effects: None (argparse may print usage/help and call sys.exit on bad input, but no
+#               filesystem or network activity)
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -92,6 +114,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# None main(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: None
+# Description: CLI entry point. Parses args, extracts the archive into datasets/raw/ unless
+#              it already looks populated (or --force is given), then prints a summary
+#              including a note about the expected-missing test/ directory (Defect 2).
+# Side Effects: Raises FileNotFoundError if the archive is missing; extracts the zip archive
+#               to disk (via extract_archive) unless already extracted and --force not given;
+#               prints ingest progress and a summary table to stdout.
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     archive_path: Path = args.archive

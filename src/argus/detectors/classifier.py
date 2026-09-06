@@ -1,40 +1,12 @@
-"""ONNX whole-frame classifier detector.
+"""ONNX whole-frame classifier detector: an alternative to
+`onnx_yolo.OnnxYoloDetector` when a straight classifier outperforms an object
+detector on a small dataset. Emits at most one whole-frame `Detection` per
+inference (never localizes).
 
-This is an alternative to `onnx_yolo.OnnxYoloDetector` for the case where a
-small dataset makes a straight image classifier more accurate than an object
-detector. The `DecisionEngine` only ever consumes `DetectionResult.p_failure`
-(the max confidence among *catastrophic*-severity detections) -- it never
-looks at bounding boxes -- so a classifier that never localizes anything can
-still drive the whole system: it just emits at most one whole-frame
-`Detection` per inference, or none at all.
-
-As with `onnx_yolo.py`, all tensor pre/post-processing lives in module-level
-*pure functions* (`preprocess_classify`, `softmax`, `probabilities_from_output`,
-`postprocess_classify`) that operate on plain numpy arrays and are fully
-unit-testable with synthetic arrays and no model file on disk.
-`ClassifierDetector` is a thin wrapper that owns the
-`onnxruntime.InferenceSession` and glues those pure functions to the
-`Detector` interface.
-
-How `p_failure` is derived on this path
-----------------------------------------
-`Severity` (in `argus.types`, a frozen contract this module does not modify)
-has only `CATASTROPHIC` and `COSMETIC` -- there is no "not a defect" value.
-Rather than force the trained `normal` class into one of those two buckets,
-a `normal` prediction is instead excluded entirely: `postprocess_classify`
-returns an empty detection tuple for it. An empty tuple means
-`DetectionResult.catastrophic` is empty too, so `DetectionResult.p_failure`
-(defined in `argus.types`) is `0.0` -- exactly as if nothing had been
-detected. The same empty-tuple treatment applies to any non-`normal`
-prediction whose confidence falls below its configured per-class threshold
-(the model could be right, but "uncertain" must never be able to stop a
-print). For every other prediction, exactly one `Detection` is emitted whose
-`confidence` is the predicted class's probability and whose `severity` comes
-from `DetectorConfig.severity` (defaulting to `Severity.COSMETIC` for a name
-that config doesn't recognize, so an unknown class can never drive a stop
-decision); `DetectionResult.p_failure` then picks that confidence up only if
-`severity` is `CATASTROPHIC`, via the ordinary logic already in
-`argus.types.DetectionResult`.
+A `normal` prediction, or one below its per-class threshold, yields an empty
+detection tuple -- so `DetectionResult.p_failure` is 0.0, same as no
+detection at all. An unrecognized class name defaults to `Severity.COSMETIC`
+so it can never drive a stop decision.
 """
 
 from __future__ import annotations
@@ -66,26 +38,21 @@ _PROB_SUM_TOLERANCE = 1e-3
 # --------------------------------------------------------------------------
 
 
+# np.ndarray preprocess_classify(np.ndarray image, int input_size)
+# Inputs: np.ndarray image - source BGR frame (HxWx3, uint8) to preprocess
+#         int input_size - target square spatial size the model expects
+# Outputs: np.ndarray - a (1, 3, input_size, input_size) float32 blob in [0, 1], RGB,
+#          channel-first
+# Description: Resizes `image` so its short side equals `input_size`, center-crops to
+#              input_size x input_size, converts BGR->RGB and HWC->CHW, scales to [0, 1], and
+#              adds a batch dimension. Must exactly mirror the classification dataset builder's
+#              training-time preprocessing (resize-short-side + center-crop) -- NOT the
+#              letterboxing `onnx_yolo.preprocess` uses for the detection path.
+# Side Effects: None (pure function of its inputs).
 def preprocess_classify(image: np.ndarray, input_size: int) -> np.ndarray:
-    """Resize-short-side-then-center-crop `image` into a model-ready blob.
-
-    **This must match the training-time preprocessing exactly.** The
-    classification dataset builder resizes each image so its short side is
-    512px, then center-crops to 512x512 -- i.e. a standard
-    resize-short-side + center-crop pipeline, not the letterboxing
-    `onnx_yolo.preprocess` uses for the detection path. Diverging from that
-    here (different interpolation, resizing the long side instead, a
-    non-centered crop, etc.) would silently skew every confidence the model
-    produces, so if the dataset builder's resize/crop logic ever changes,
-    this function must change with it.
-
-    Steps: resize so `min(height, width) == input_size` (preserving aspect
-    ratio), center-crop to `input_size x input_size`, BGR -> RGB,
-    HWC -> CHW, cast to float32 and scale to [0, 1], then add a batch
-    dimension.
-
-    Returns a `(1, 3, input_size, input_size)` float32 array in [0, 1].
-    """
+    """Must exactly match the classification dataset builder's training-time
+    resize-short-side + center-crop (not the detection path's letterboxing) --
+    diverging here silently skews every confidence the model produces."""
     orig_h, orig_w = image.shape[:2]
     short_side = min(orig_h, orig_w)
     scale = input_size / short_side
@@ -112,34 +79,37 @@ def preprocess_classify(image: np.ndarray, input_size: int) -> np.ndarray:
     return blob[np.newaxis, ...]
 
 
+# np.ndarray softmax(np.ndarray logits)
+# Inputs: np.ndarray logits - raw scores, any shape, softmax applied along the last axis
+# Outputs: np.ndarray - probability distribution(s) of the same shape as `logits`, summing to
+#          1.0 along the last axis
+# Description: Numerically stable softmax: subtracts the per-row max before exponentiating so
+#              large logits cannot overflow `exp`.
+# Side Effects: None (pure function of its input).
 def softmax(logits: np.ndarray) -> np.ndarray:
-    """Numerically stable softmax along the last axis.
-
-    Subtracts the per-row max before exponentiating so large logits (e.g.
-    from an unbounded classification head) cannot overflow `exp`.
-    """
     arr = np.asarray(logits, dtype=np.float64)
     shifted = arr - np.max(arr, axis=-1, keepdims=True)
     exp = np.exp(shifted)
     return exp / np.sum(exp, axis=-1, keepdims=True)
 
 
+# np.ndarray probabilities_from_output(np.ndarray raw)
+# Inputs: np.ndarray raw - raw classifier output row(s), shape (N,) or (B, N)
+# Outputs: np.ndarray - a valid probability distribution of the same shape, summing to 1.0
+#          along the last axis
+# Description: Detects whether `raw` already looks like a probability distribution (every
+#              value in [0, 1] within a small tolerance, each row summing to 1.0 within 1e-3)
+#              and returns it unchanged if so; otherwise treats it as raw logits and applies
+#              `softmax`. This avoids double-softmax-ing Ultralytics classification heads (and
+#              similar exports) that already apply softmax internally -- softmax-ing an
+#              already-softmaxed output would flatten sharp confidences toward uniform and
+#              silently wreck every configured threshold.
+# Side Effects: None (pure function of its input).
 def probabilities_from_output(raw: np.ndarray) -> np.ndarray:
-    """Turn a raw classifier output row into a probability distribution.
-
-    Ultralytics classification heads (and many other classifier exports)
-    already apply softmax internally, so their ONNX output is already a
-    valid probability distribution. Blindly softmax-ing such an output again
-    would flatten already-sharp confidences toward uniform and silently
-    wreck every configured threshold. This function instead detects whether
-    `raw` already looks like a probability distribution -- every value in
-    `[0, 1]` (within a small float tolerance) and each row summing to `1.0`
-    within `1e-3` -- and only applies `softmax` when it does not (i.e. `raw`
-    looks like raw, unnormalized logits).
-
-    Works on both a single row (shape `(N,)`) and a batch (shape `(B, N)`);
-    the checks are applied along the last axis.
-    """
+    """Ultralytics classification heads already output softmaxed
+    probabilities; softmax-ing them again would flatten sharp confidences
+    toward uniform and silently invalidate every configured threshold. Only
+    applies `softmax` when `raw` doesn't already look like a distribution."""
     arr = np.asarray(raw, dtype=np.float64)
     in_unit_interval = bool(
         np.all(arr >= -_PROB_VALUE_EPS) and np.all(arr <= 1.0 + _PROB_VALUE_EPS)
@@ -152,6 +122,31 @@ def probabilities_from_output(raw: np.ndarray) -> np.ndarray:
     return softmax(arr)
 
 
+# tuple[Detection, ...] postprocess_classify(np.ndarray raw, Sequence[str] class_names, Mapping[str, float] class_thresholds, float default_threshold, Mapping[str, Severity] severity_map, tuple[int, int] orig_shape)
+# Inputs: np.ndarray raw - raw classifier ONNX output, shape (N,) or (1, N) where
+#                 N == len(class_names)
+#         Sequence[str] class_names - ordered class names matching the model's output index
+#                 order
+#         Mapping[str, float] class_thresholds - per-class-name confidence threshold overrides
+#         float default_threshold - threshold used for any class name absent from
+#                 `class_thresholds`
+#         Mapping[str, Severity] severity_map - per-class-name Severity; a name absent from it
+#                 defaults to Severity.COSMETIC so an unrecognized class can never drive a stop
+#                 decision
+#         tuple[int, int] orig_shape - (height, width) of the original frame, used to build the
+#                 whole-frame placeholder bbox
+# Outputs: tuple[Detection, ...] - empty, or exactly one Detection for the predicted class
+# Description: Converts `raw` to probabilities via `probabilities_from_output`, takes the
+#              argmax as the predicted class, and returns `()` if the prediction is "normal"
+#              (case-insensitive -- a classifier's `normal` class has no "not a defect"
+#              Severity to map to) or below its configured threshold (an uncertain prediction
+#              must never be able to stop a print). Otherwise returns a single Detection whose
+#              bbox spans the whole frame (0, 0, W, H) (a classifier localizes nothing; the box
+#              is a placeholder for downstream notification-image code written against the
+#              detection path's bbox contract), confidence is the predicted class's
+#              probability, and severity comes from `severity_map`. Raises `ValueError` if
+#              `raw`'s shape doesn't match `class_names`.
+# Side Effects: None (pure function of its inputs).
 def postprocess_classify(
     raw: np.ndarray,
     class_names: Sequence[str],
@@ -160,31 +155,6 @@ def postprocess_classify(
     severity_map: Mapping[str, Severity],
     orig_shape: tuple[int, int],
 ) -> tuple[Detection, ...]:
-    """Turn a raw classifier ONNX output into zero or one `Detection`.
-
-    Accepts `raw` shaped `(N,)` or `(1, N)` where `N == len(class_names)`;
-    raises `ValueError` if `N` doesn't match. Converts to probabilities via
-    `probabilities_from_output`, then takes the argmax as the predicted
-    class:
-
-    - if the predicted class is `"normal"` (case-insensitive) -> `()`. A
-      classifier trained on a `normal` class has no "not a defect"
-      `Severity` to map to (see module docstring), so `normal` predictions
-      are excluded from the output entirely rather than tagged with either
-      `Severity` value.
-    - otherwise, if the predicted class's probability is below its
-      configured threshold (`class_thresholds.get(name, default_threshold)`)
-      -> `()`. An uncertain prediction must never be able to drive a stop
-      decision.
-    - otherwise -> a single `Detection` whose `bbox` spans the *whole
-      frame* `(0, 0, W, H)` (a classifier localizes nothing; the box is a
-      placeholder so downstream notification-image code, written against
-      the detection path's bbox contract, still has something to draw),
-      `confidence` is the predicted class's probability, and `severity`
-      comes from `severity_map` (defaulting to `Severity.COSMETIC` for a
-      name absent from it, so an unrecognized class can never drive the
-      stop decision).
-    """
     arr = np.asarray(raw)
     if arr.ndim == 2:
         if arr.shape[0] != 1:
@@ -228,37 +198,25 @@ def postprocess_classify(
     return (detection,)
 
 
+# Optional[tuple[str, ...]] class_names_from_onnx_metadata(Any session)
+# Inputs: Any session - the onnxruntime InferenceSession (or a duck-typed fake in tests)
+#                 whose embedded class-name metadata should be read
+# Outputs: Optional[tuple[str, ...]] - class names ordered by index, or None if the metadata is
+#          missing, unparseable, empty, or has non-dense integer keys
+# Description: Best-effort extraction of the model's own training-time class-name order from
+#              its ONNX `metadata_props` (`session.get_modelmeta().custom_metadata_map["names"]`,
+#              a Python dict-repr string Ultralytics writes at export time), so a wrong
+#              `class_names` order in config is never the only line of defense. Deliberately
+#              defensive: any exception while reading or parsing is caught and logged rather
+#              than allowed to crash startup.
+# Side Effects: Logs a warning (via the module logger) if the metadata is present but fails to
+#               parse; otherwise none.
 def class_names_from_onnx_metadata(session: Any) -> Optional[tuple[str, ...]]:
-    """Best-effort extraction of the model's own class-name order from ONNX
-    metadata, so a wrong `class_names` order in config is never the only
-    line of defense (see the class-order pitfall described in
-    `training/evaluate_classifier.py` and `training/export_classifier_onnx.py`).
-
-    Ultralytics writes the training-time class mapping into the exported
-    model's `metadata_props` as a `names` entry -- a Python dict-repr
-    string such as `"{0: 'cracking', 1: 'layer_shifting', ..., 5:
-    'warping'}"`, indexed exactly the way the model's output columns are
-    (Ultralytics assigns indices alphabetically from the training folder
-    names). onnxruntime surfaces `metadata_props` as
-    `session.get_modelmeta().custom_metadata_map`, a plain `dict[str, str]`.
-
-    `session` is accepted as `Any` (duck-typed) rather than
-    `ort.InferenceSession` so this also works against a lightweight fake
-    session in tests, with no real model file required.
-
-    Returns a tuple ordered by index, or `None` if:
-      - `custom_metadata_map` has no `names` entry (or it's falsy), or
-      - the entry doesn't parse as a Python literal, or
-      - it doesn't parse to a non-empty dict, or
-      - its keys aren't exactly the dense integer range `0..N-1` (a partial
-        or garbled mapping can't be trusted to reconstruct index order).
-
-    In every such case the caller must fall back to config rather than
-    trust a partial/garbled read. This function is deliberately defensive:
-    any exception while reading or parsing the metadata is caught and
-    logged, never allowed to crash startup over some other exporter's
-    model having a metadata quirk.
-    """
+    """Reads Ultralytics' `names` dict-repr string from
+    `custom_metadata_map`, so a wrong `class_names` order in config is never
+    the only line of defense. Returns None (rather than a partial/garbled
+    result) if the entry is missing, unparseable, empty, or its keys aren't
+    a dense `0..N-1` range."""
     try:
         modelmeta = session.get_modelmeta()
         custom_metadata = getattr(modelmeta, "custom_metadata_map", None) or {}
@@ -281,25 +239,21 @@ def class_names_from_onnx_metadata(session: Any) -> Optional[tuple[str, ...]]:
         return None
 
 
+# tuple[str, ...] resolve_class_names(Any session, Sequence[str] configured_class_names)
+# Inputs: Any session - the onnxruntime InferenceSession (or duck-typed fake) to read
+#                 embedded class-name metadata from
+#         Sequence[str] configured_class_names - `DetectorConfig.class_names` as configured
+#                 (may be empty)
+# Outputs: tuple[str, ...] - the class-name order to use for this detector instance
+# Description: Reconciles `configured_class_names` against
+#              `class_names_from_onnx_metadata(session)` per the rules in this function's own
+#              docstring: metadata's order wins when config is empty; matching values are
+#              returned as independently-confirmed; a genuine disagreement raises `ValueError`
+#              naming both orderings rather than silently picking one; metadata absent falls
+#              back to config with a logged warning; both absent raises `ValueError`.
+# Side Effects: Logs an info or warning message (via the module logger) describing which source
+#               of truth was used.
 def resolve_class_names(session: Any, configured_class_names: Sequence[str]) -> tuple[str, ...]:
-    """Reconcile `configured_class_names` (from `DetectorConfig.class_names`)
-    against `class_names_from_onnx_metadata(session)` so a wrong config
-    order can never silently mislabel every prediction:
-
-    - metadata present, config empty -> the metadata's order (the best
-      default: it comes straight from the model that produced it, so there
-      is no way for a human to get it wrong).
-    - metadata present, config non-empty, and they DISAGREE -> raises
-      `ValueError` naming both orderings explicitly, so the operator knows
-      exactly which one to fix. The mismatch is never silently resolved in
-      either direction.
-    - metadata present, config non-empty, and they agree -> the configured
-      order, now independently confirmed correct.
-    - metadata absent or unparseable -> the configured order, with a
-      logged warning that it could not be independently verified.
-    - metadata absent AND config empty -> raises `ValueError` (nothing to
-      go on at all).
-    """
     configured = tuple(configured_class_names)
     metadata = class_names_from_onnx_metadata(session)
 
@@ -341,16 +295,20 @@ def resolve_class_names(session: Any, configured_class_names: Sequence[str]) -> 
     return configured
 
 
+# Optional[int] _static_input_size(Optional[Sequence[object]] shape)
+# Inputs: Optional[Sequence[object]] shape - the ONNX-declared input shape (e.g. from
+#                 `session.get_inputs()[0].shape`), possibly containing symbolic/dynamic dims
+# Outputs: Optional[int] - the static square spatial size (e.g. 512), or None if the shape is
+#          missing, not 4D, dynamic, or non-square
+# Description: Extracts a usable static input size from a declared ONNX input shape so the
+#              caller can fall back to `cfg.input_size` when the model's shape doesn't pin one
+#              down. Duplicated from `onnx_yolo._static_input_size` rather than imported --
+#              that helper is private to that module and this one is deliberately kept free of
+#              any dependency on the detection-path module.
+# Side Effects: None (pure function of its input).
 def _static_input_size(shape: Optional[Sequence[object]]) -> Optional[int]:
-    """Return the model's static square spatial input size (e.g. 512 for an
-    input shaped `[1, 3, 512, 512]`), or None if the shape is missing,
-    non-4D, dynamic (a symbolic dim shows up as a non-int), or non-square --
-    any of which means the caller should fall back to config.
-
-    (Duplicated from `onnx_yolo._static_input_size` rather than imported --
-    that helper is private to that module and this one is deliberately kept
-    free of any dependency on the detection-path module.)
-    """
+    # Duplicated from onnx_yolo._static_input_size rather than imported: that
+    # helper is private, and this module stays free of detection-path deps.
     if shape is None or len(shape) != 4:
         return None
     h, w = shape[2], shape[3]
@@ -366,19 +324,23 @@ def _static_input_size(shape: Optional[Sequence[object]]) -> Optional[int]:
 
 class ClassifierDetector(Detector):
     """`Detector` implementation backed by an ONNX whole-frame classifier.
-
-    `cfg.class_names` (the ordered class list matching the model's output
-    index order) is reconciled against the class-name order embedded in the
-    ONNX model's own metadata via `resolve_class_names` -- see that
-    function's docstring for the exact rules. In short: an empty config
-    value defers to the model's metadata when available; a non-empty value
-    that disagrees with the metadata raises `ValueError` rather than
-    silently preferring either one. This makes the config-order mixup
-    described in the module docstring (and `training/evaluate_classifier.
-    py`'s class-order pitfall) something that fails loudly at startup
+    `cfg.class_names` is reconciled against the model's own ONNX metadata via
+    `resolve_class_names`, so a mismatched order fails loudly at startup
     instead of silently mislabeling every prediction.
     """
 
+    # None __init__(DetectorConfig cfg)
+    # Inputs: DetectorConfig cfg - detector configuration: model path, providers, input size,
+    #                 class names, thresholds, and severity map
+    # Outputs: None
+    # Description: Loads the ONNX classifier model into an onnxruntime InferenceSession,
+    #              resolves the class-name order via `resolve_class_names` (reconciled against
+    #              the model's own embedded metadata), and determines the model's input size
+    #              (its static declared shape if available, else `cfg.input_size`).
+    # Side Effects: Reads `cfg.model_path` from disk; raises `FileNotFoundError` if it doesn't
+    #               exist. Constructs an `onnxruntime.InferenceSession` (allocates model
+    #               resources). Logs an info message. Mutates the new instance's state
+    #               (`_cfg`, `_session`, `_input_name`, `_class_names`, `_input_size`).
     def __init__(self, cfg: DetectorConfig) -> None:
         self._cfg = cfg
 
@@ -404,6 +366,18 @@ class ClassifierDetector(Detector):
             self._class_names,
         )
 
+    # DetectionResult infer(Frame frame)
+    # Inputs: Frame frame - the captured camera frame to classify
+    # Outputs: DetectionResult - zero or one Detection (see `postprocess_classify`), plus the
+    #          measured inference time in milliseconds
+    # Description: Runs the full classify pipeline for one frame: `preprocess_classify` builds
+    #              the model input blob, the ONNX session runs inference, and
+    #              `postprocess_classify` turns the raw output into a `DetectionResult`. Only a
+    #              CATASTROPHIC-severity detection here would ever raise `p_failure`; a
+    #              `normal` prediction produces no detection at all (see module docstring).
+    # Side Effects: Runs ONNX model inference (CPU/GPU work via `self._session.run`); reads
+    #               `time.perf_counter()` to measure elapsed time. Raises `RuntimeError` if the
+    #               detector has already been `close()`d.
     def infer(self, frame: Frame) -> DetectionResult:
         if self._session is None:
             raise RuntimeError("ClassifierDetector is closed")
@@ -423,5 +397,13 @@ class ClassifierDetector(Detector):
         inference_ms = (time.perf_counter() - start) * 1000.0
         return DetectionResult(detections=detections, inference_ms=inference_ms)
 
+    # None close()
+    # Inputs: None
+    # Outputs: None
+    # Description: Releases the ONNX InferenceSession so `infer` can no longer be called on
+    #              this instance.
+    # Side Effects: Mutates instance state, dropping the reference to `self._session` (allowing
+    #               the underlying onnxruntime resources to be garbage-collected). Subsequent
+    #               `infer` calls will raise `RuntimeError`.
     def close(self) -> None:
         self._session = None

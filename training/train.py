@@ -1,60 +1,11 @@
-"""Train either the detection model (training/prepare_dataset.py's
-datasets/argus/data.yaml) or the classification model (training/
-build_classification_dataset.py's datasets/argus_cls/{train,val,test}/
-<class>/*.jpg) with a single shared CLI.
+"""Trains either the detection model (datasets/argus/data.yaml) or the classification model (datasets/argus_cls/{train,val,test}/<class>/*.jpg) with a single shared CLI. ``--task`` picks the trainer; if omitted, it's auto-detected from ``--weights`` (a ``-cls`` substring means classify).
 
-Task selection: `--task {detect,classify}` picks which Ultralytics trainer
-runs. If `--task` is omitted it is auto-detected from `--weights`: a
-filename containing `-cls` (e.g. `yolo26s-cls.pt`) resolves to `classify`,
-anything else resolves to `detect`. An explicit `--task` always overrides
-the auto-detection. `--data` is validated according to the resolved task:
-detection requires an existing `data.yaml` file; classification requires an
-existing directory with `train/` and `val/` subdirectories that each
-contain at least one class subfolder (the layout
-training/build_classification_dataset.py produces).
+``flipud=0.0``: a print is never upside down, so vertical flips would manufacture impossible images; ``fliplr`` stays on since left/right framing is arbitrary.
 
-Key choice: `flipud=0.0` (vertical-flip augmentation disabled). A camera
-looking at a 3D printer never sees an upside-down print, so vertical flips
-manufacture physically-impossible training images -- that's capacity spent
-learning to recognize something that can't happen. `fliplr=0.5` (horizontal
-flip) is kept since the camera's left/right framing is arbitrary. This
-applies to both tasks. All other Ultralytics augmentation/hyperparameters
-are left at their defaults.
+``--optimizer`` defaults to ``AdamW`` (not Ultralytics' ``auto``): at some batch/imgsz combos, ``auto`` selects a MuSGD/Muon implementation that crashes on a non-contiguous `.view()`, and the choice silently varies with batch size. ``--lr0`` defaults to ``0.001``, the right scale for AdamW (not SGD's 0.01).
 
-Key choice: `--optimizer` defaults to `AdamW` instead of Ultralytics'
-`auto`. With `optimizer=auto`, Ultralytics picks the optimizer via an
-internal heuristic that depends on batch size and other run settings --
-it is not a stable, reproducible choice. At `--batch 32 --imgsz 512` the
-heuristic selects MuSGD (Muon), and the Muon implementation shipped in the
-installed ultralytics 8.4.137 (ultralytics/optim/muon.py, muon_update) calls
-`.view()` on a non-contiguous tensor, which crashes with:
-    RuntimeError: view size is not compatible with input tensor's size and
-    stride (at least one dimension spans across two contiguous subspaces).
-    Use .reshape(...) instead.
-This is an upstream bug in that Muon code path. A different batch/imgsz
-combination can make `auto` pick a different (working) optimizer, which is
-exactly the problem: the same script can crash or not depending on flags,
-with no code change. Pinning `optimizer=AdamW` sidesteps the buggy code
-path entirely and makes runs reproducible. AdamW is also the well-tested
-default for fine-tuning YOLOv8n.
-
-Pinning the optimizer disables Ultralytics' automatic LR selection, so
-`--lr0` is also explicit here and defaults to `0.001` -- the appropriate
-starting LR for AdamW fine-tuning (Ultralytics' own auto-selection uses
-~0.001 for AdamW; the library-wide default of 0.01 is an SGD-scale LR and
-would be far too hot for AdamW).
-
-Usage:
-    # Detection (default task; datasets/argus/data.yaml)
-    python training/train.py
-    python training/train.py --epochs 100 --batch 32 --imgsz 512 --device 0
-    python training/train.py --epochs 3 --name smoke_test   # quick smoke test
-
-    # Classification (auto-detected from a '-cls' weights filename)
-    python training/train.py --data datasets/argus_cls --weights yolo26s-cls.pt \
-        --epochs 100 --batch 64 --imgsz 512 --device 0
-    # ...or force the task explicitly regardless of the weights filename:
-    python training/train.py --data datasets/argus_cls --weights best.pt --task classify
+Usage: python training/train.py [--epochs N] [--batch N] [--imgsz N] [--device 0]
+       python training/train.py --data datasets/argus_cls --weights yolo26s-cls.pt --task classify
 """
 
 from __future__ import annotations
@@ -67,6 +18,16 @@ DEFAULT_DATA_YAML = REPO_ROOT / "datasets" / "argus" / "data.yaml"
 DEFAULT_PROJECT = REPO_ROOT / "runs" / "train"
 
 
+# argparse.Namespace parse_args(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: argparse.Namespace - parsed training options (data, weights, task, epochs, batch,
+#          imgsz, device, seed, patience, project, name, fliplr, optimizer, lr0, exist_ok).
+#          Notable defaults: --fliplr 0.5 (horizontal flip kept), --optimizer AdamW and
+#          --lr0 0.001 (pinned to avoid the upstream Muon crash under optimizer=auto, see
+#          module docstring), --seed 1337.
+# Description: Defines and parses the shared CLI for detection and classification training.
+# Side Effects: None (argparse may print usage/help and call sys.exit on bad input, but no
+#               filesystem or network activity)
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -111,25 +72,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# str resolve_task(str | None explicit_task, str weights)
+# Inputs: str | None explicit_task - the --task value if the user passed one explicitly
+#         str weights - the --weights filename, used for auto-detection when explicit_task
+#         is None
+# Outputs: str - "classify" or "detect"
+# Description: Resolves the training task. An explicit --task always wins; otherwise
+#              auto-detects from the weights filename ("-cls" substring means classify).
+# Side Effects: None
 def resolve_task(explicit_task: str | None, weights: str) -> str:
-    """Resolve the training task.
-
-    An explicit `--task` always wins. Otherwise, auto-detect from the
-    weights filename: Ultralytics classification checkpoints are named like
-    `yolo26s-cls.pt` / `yolov8n-cls.pt`, so a `-cls` substring in the
-    filename means `classify`; anything else means `detect`.
-    """
     if explicit_task is not None:
         return explicit_task
     return "classify" if "-cls" in Path(weights).name else "detect"
 
 
+# None validate_data(str task, Path data)
+# Inputs: str task - resolved task, "detect" or "classify"
+#         Path data - the --data path to validate (a data.yaml file for detect, a dataset
+#         directory for classify)
+# Outputs: None
+# Description: Validates --data against the requirements of the resolved task, delegating to
+#              _validate_classify_data for the classify case.
+# Side Effects: Raises FileNotFoundError with an actionable message if the dataset referenced
+#               by data isn't in the shape the task needs. No filesystem writes.
 def validate_data(task: str, data: Path) -> None:
-    """Validate `--data` against the requirements of the resolved task.
-
-    Raises FileNotFoundError with an actionable message if the dataset
-    referenced by `data` isn't in the shape the task needs.
-    """
     if task == "classify":
         _validate_classify_data(data)
         return
@@ -141,6 +107,15 @@ def validate_data(task: str, data: Path) -> None:
         )
 
 
+# None _validate_classify_data(Path data)
+# Inputs: Path data - candidate classification dataset directory
+# Outputs: None
+# Description: Checks that data is a directory containing train/ and val/ subdirectories
+#              that each have at least one class subfolder (the layout
+#              build_classification_dataset.py produces).
+# Side Effects: Raises FileNotFoundError with an actionable message (naming the missing pieces
+#               and pointing at training/build_classification_dataset.py) if the layout is
+#               invalid. No filesystem writes.
 def _validate_classify_data(data: Path) -> None:
     build_hint = "Run training/build_classification_dataset.py first."
 
@@ -163,6 +138,17 @@ def _validate_classify_data(data: Path) -> None:
         )
 
 
+# None main(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: None
+# Description: CLI entry point. Resolves the task, validates the dataset, loads the starting
+#              weights, runs Ultralytics model.train() with flipud=0.0 (vertical flip disabled
+#              because a print is never upside down -- see module docstring) and the pinned
+#              AdamW optimizer/lr0, then reports the resulting run directory and weights paths.
+# Side Effects: Imports ultralytics.YOLO lazily; loads model weights (may download the base
+#               checkpoint if not cached locally); runs a full GPU/CPU training job that writes
+#               checkpoints, logs, and run artifacts under --project/--name on disk; prints
+#               progress and a completion summary to stdout.
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     task = resolve_task(args.task, args.weights)

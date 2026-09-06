@@ -1,33 +1,8 @@
-"""Export the trained classification checkpoint (best.pt) to ONNX and verify
-it two independent ways:
+"""Exports the trained classification checkpoint (best.pt) to ONNX and verifies it two ways: (1) a raw onnxruntime pass confirms output shape is exactly ``(1, num_classes)``; (2) the project's own ``ClassifierDetector`` classifies real test images end to end, proving the exported artifact and runtime detector agree.
 
-  1. A raw onnxruntime pass on a random input confirms the exported model's
-     output shape is exactly ``(1, num_classes)`` -- one probability per
-     class, nothing else baked in.
-  2. The project's OWN runtime code, `argus.detectors.classifier.
-     ClassifierDetector`, loads the exported .onnx file and classifies a
-     handful of REAL test images end to end (preprocess -> onnxruntime
-     session -> postprocess). This is the check that actually matters: it
-     proves the trained artifact and the runtime detector agree with each
-     other, not just that the .onnx file loads in isolation.
+Ultralytics indexes classification outputs alphabetically by training folder name, not any human-readable config order, and ``ClassifierDetector`` trusts ``cfg.class_names`` to already match it -- so this script builds ``class_names`` from the checkpoint's own ``model.names``, never from config.example.yaml, so the sanity check can't be mislabeled the same way.
 
-Class-order pitfall (see training/evaluate_classifier.py's module
-docstring for the full story, and its measured
-`check_class_order_matches_model` finding): Ultralytics classification
-checkpoints index their output ALPHABETICALLY from the training folder
-names (``['cracking', 'layer_shifting', 'normal', 'spaghetti', 'stringing',
-'warping']``), NOT the "normal, spaghetti, cracking, layer_shifting,
-stringing, warping" order config.example.yaml's commented-out
-classification block lists for human readability.
-`ClassifierDetector` has no way to know the model's true index order on its
-own -- it *trusts* `cfg.class_names` to already match it. This script
-therefore builds `class_names` from the loaded checkpoint's own `model.
-names` (index-sorted), NEVER from config.example.yaml's human-readable
-list, so step 2's sanity check can't itself be mislabeled the same way a
-naive config wiring would be.
-
-Usage:
-    python training/export_classifier_onnx.py --weights runs/train/cls_v1/weights/best.pt --imgsz 512
+Usage: python training/export_classifier_onnx.py --weights runs/train/cls_v1/weights/best.pt --imgsz 512
 """
 
 from __future__ import annotations
@@ -46,23 +21,27 @@ DEFAULT_TEST_DATA_DIR = REPO_ROOT / "datasets" / "argus_cls" / "test"
 
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png")
 
-#: The real production severity mapping from config.example.yaml's
-#: commented-out classification block: only "spaghetti" is catastrophic
-#: (can drive an automated pause/cancel); everything else is cosmetic.
-#: Used for the ClassifierDetector sanity check so it exercises the actual
-#: p_failure wiring, not a stripped-down stand-in.
+#: Real production severity mapping (only "spaghetti" is catastrophic) so the sanity check
+#: exercises actual p_failure wiring, not a stand-in.
 _SEVERITY_MAP_NAMES: dict[str, str] = {
     "spaghetti": "catastrophic",
     "cracking": "cosmetic",
     "layer_shifting": "cosmetic",
     "stringing": "cosmetic",
     "warping": "cosmetic",
-    # "normal" deliberately omitted -- postprocess_classify short-circuits
-    # any "normal" prediction to zero detections before severity is ever
-    # consulted (see argus.detectors.classifier module docstring).
+    # "normal" omitted -- postprocess_classify short-circuits it before severity is consulted.
 }
 
 
+# argparse.Namespace parse_args(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: argparse.Namespace - parsed --weights, --imgsz (default 512), --opset (default 12),
+#          --out (default models/argus_cls.onnx), --no-simplify, --test-data (default
+#          datasets/argus_cls/test), --samples-per-class (default 1, deterministic: first N
+#          images sorted by filename)
+# Description: Defines and parses the CLI for exporting and verifying the classifier ONNX model.
+# Side Effects: None (argparse may print usage/help and call sys.exit on bad input, but no
+#               filesystem or network activity)
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--weights", type=Path, required=True, help="Path to trained best.pt")
@@ -92,15 +71,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # --------------------------------------------------------------------------
 
 
+# tuple[Path, Optional[dict[int, str]]] export_to_onnx(Path weights, int imgsz, int opset, bool simplify)
+# Inputs: Path weights - path to the trained classification best.pt checkpoint
+#         int imgsz - export image size, must match the imgsz used for training
+#         int opset - ONNX opset version to export with
+#         bool simplify - whether to run onnxslim simplification on the exported graph
+# Outputs: tuple[Path, Optional[dict[int, str]]] - path Ultralytics wrote the ONNX file to, and
+#          the checkpoint's {class_id: class_name} mapping (model.names) in the model's real
+#          output-index order, or None if unavailable
+# Description: Runs the Ultralytics ONNX export for the classification checkpoint and returns
+#              the output path plus the model's own class-name mapping, so the caller can build
+#              class_names for the ClassifierDetector sanity check from the actual model rather
+#              than assuming any particular order (see module docstring's class-order pitfall).
+# Side Effects: Imports ultralytics.YOLO lazily; loads the checkpoint into memory; writes an
+#               .onnx file to disk (path chosen by Ultralytics, alongside the weights file).
 def export_to_onnx(weights: Path, imgsz: int, opset: int, simplify: bool) -> tuple[Path, Optional[dict[int, str]]]:
-    """Run the Ultralytics ONNX export and return `(exported_path, names)`.
-
-    `names` is the `{class_id: class_name}` mapping baked into the
-    checkpoint (`model.names`) -- the model's REAL output-index order (see
-    module docstring). Returning it lets the caller build `class_names` for
-    the ClassifierDetector sanity check from the actual model being
-    exported instead of assuming any particular order.
-    """
     from ultralytics import YOLO
 
     model = YOLO(str(weights))
@@ -109,10 +94,16 @@ def export_to_onnx(weights: Path, imgsz: int, opset: int, simplify: bool) -> tup
     return Path(exported_path), names
 
 
+# tuple[str, ...] ordered_class_names(Mapping[int, str] names_by_idx)
+# Inputs: Mapping[int, str] names_by_idx - {class_id: class_name} mapping from the checkpoint
+# Outputs: tuple[str, ...] - class names ordered by index, i.e. exactly what cfg.class_names
+#          must be for ClassifierDetector to interpret the ONNX output correctly
+# Description: Converts an {idx: name} mapping into an index-ordered tuple -- the model's real
+#              output-index order (Ultralytics classification checkpoints index alphabetically
+#              from training folder names, not any human-readable config order; see module
+#              docstring's class-order pitfall).
+# Side Effects: None
 def ordered_class_names(names_by_idx: Mapping[int, str]) -> tuple[str, ...]:
-    """`{idx: name}` -> a tuple ordered by index -- the model's real
-    output-index order, i.e. exactly what `cfg.class_names` must be for
-    `ClassifierDetector` to interpret the ONNX output correctly."""
     return tuple(names_by_idx[i] for i in sorted(names_by_idx))
 
 
@@ -121,11 +112,19 @@ def ordered_class_names(names_by_idx: Mapping[int, str]) -> tuple[str, ...]:
 # --------------------------------------------------------------------------
 
 
+# tuple[int, ...] verify_onnx_output_shape(Path onnx_path, int imgsz, int num_classes)
+# Inputs: Path onnx_path - path to the exported classifier ONNX model
+#         int imgsz - input image size the model expects (square input)
+#         int num_classes - expected number of output classes
+# Outputs: tuple[int, ...] - the observed output shape (asserted to equal (1, num_classes))
+# Description: Loads onnx_path with onnxruntime, runs one deterministic random input through
+#              it, and asserts the output shape is exactly (1, num_classes) -- one probability
+#              per class and nothing else baked in.
+# Side Effects: Loads the ONNX file into an onnxruntime InferenceSession (CPU); runs one
+#               forward pass. RNG is a locally-created np.random.default_rng(seed=1337), so it
+#               does not touch global RNG state. Raises AssertionError if the output shape
+#               doesn't match (1, num_classes).
 def verify_onnx_output_shape(onnx_path: Path, imgsz: int, num_classes: int) -> tuple[int, ...]:
-    """Load `onnx_path` with onnxruntime, run one random input through it,
-    and assert the output shape is exactly `(1, num_classes)` -- one
-    probability per class and nothing else. Raises `AssertionError`
-    otherwise. Returns the observed shape."""
     import onnxruntime as ort
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
@@ -153,12 +152,17 @@ def verify_onnx_output_shape(onnx_path: Path, imgsz: int, num_classes: int) -> t
 # --------------------------------------------------------------------------
 
 
+# list[tuple[Path, str]] pick_sample_images(Path test_data_dir, Sequence[str] class_names, int samples_per_class)
+# Inputs: Path test_data_dir - classification test-split directory (test_data_dir/<class>/*.jpg)
+#         Sequence[str] class_names - class names to sample, in the model's real output order
+#         int samples_per_class - how many images to pick per class
+# Outputs: list[tuple[Path, str]] - (image_path, class_name) pairs for the sanity check
+# Description: Deterministically picks up to samples_per_class images from
+#              test_data_dir/<class>/ for each of class_names (sorted by filename, first N).
+#              Classes with no test-split subdirectory (or no images) are skipped -- not every
+#              class necessarily has test images (see split_report.json's "evaluable" field).
+# Side Effects: None (read-only filesystem listing)
 def pick_sample_images(test_data_dir: Path, class_names: Sequence[str], samples_per_class: int) -> list[tuple[Path, str]]:
-    """Deterministically pick up to `samples_per_class` images from
-    `test_data_dir/<class>/` for each of `class_names` (sorted by filename,
-    first N). Classes with no test-split subdirectory (or no images) are
-    skipped -- not every class necessarily has test images (see
-    datasets/argus_cls/split_report.json's `evaluable` field)."""
     samples: list[tuple[Path, str]] = []
     for cname in class_names:
         class_dir = test_data_dir / cname
@@ -169,14 +173,21 @@ def pick_sample_images(test_data_dir: Path, class_names: Sequence[str], samples_
     return samples
 
 
+# DetectorConfig build_sanity_check_config(Path onnx_path, tuple[str, ...] class_names, int input_size)
+# Inputs: Path onnx_path - path to the exported classifier ONNX model
+#         tuple[str, ...] class_names - class names in the model's real output-index order
+#         int input_size - input image size the model expects (square input)
+# Outputs: DetectorConfig - config with default_threshold=0.0 (so every non-"normal"
+#          prediction always surfaces a Detection) and the real production severity map
+#          (_SEVERITY_MAP_NAMES, where only "spaghetti" is catastrophic)
+# Description: Builds a DetectorConfig for the ClassifierDetector sanity check: a zero
+#              threshold so every non-"normal" prediction is visible regardless of confidence,
+#              but the real production severity mapping so p_failure is computed through the
+#              actual catastrophic-path wiring rather than a stand-in.
+# Side Effects: None (imports argus.config/argus.types; constructs a config object, no I/O)
 def build_sanity_check_config(onnx_path: Path, class_names: tuple[str, ...], input_size: int):
-    """Build a `DetectorConfig` for the sanity check: threshold 0.0 for
-    every class (so every non-"normal" prediction always surfaces a
-    `Detection`, regardless of confidence -- we want to SEE the raw
-    argmax/confidence for each sample, not have some silently suppressed),
-    but the REAL production severity mapping (`_SEVERITY_MAP_NAMES`) so
-    `p_failure` is computed through the actual catastrophic-path wiring,
-    not a stand-in."""
+    """Threshold 0.0 so every non-"normal" prediction surfaces regardless of confidence,
+    but the real production severity map so p_failure runs through actual catastrophic wiring."""
     from argus.config import DetectorConfig
     from argus.types import Severity
 
@@ -193,18 +204,25 @@ def build_sanity_check_config(onnx_path: Path, class_names: tuple[str, ...], inp
     )
 
 
+# list[dict[str, object]] run_classifier_detector_sanity_check(Path onnx_path, tuple[str, ...] class_names, Sequence[tuple[Path, str]] samples, int input_size)
+# Inputs: Path onnx_path - path to the exported classifier ONNX model
+#         tuple[str, ...] class_names - class names in the model's real output-index order
+#         Sequence[tuple[Path, str]] samples - (image_path, true_class) pairs to classify
+#         int input_size - input image size the model expects (square input)
+# Outputs: list[dict[str, object]] - one result dict per sample: path, true_class,
+#          predicted_class, confidence (or None if "normal"), severity, p_failure, correct
+#          (bool), and inference_ms
+# Description: Loads onnx_path through the project's own ClassifierDetector (the actual runtime
+#              code, not a reimplementation) and classifies each sample end to end
+#              (preprocess -> onnxruntime session -> postprocess), proving the trained artifact
+#              and the runtime detector agree with each other.
+# Side Effects: Reads each sample image from disk via cv2.imread; constructs and closes an
+#               onnxruntime-backed ClassifierDetector session (detector.close() in a finally
+#               block); raises IOError if an image fails to load; raises AssertionError if any
+#               confidence or p_failure value falls outside [0, 1].
 def run_classifier_detector_sanity_check(
     onnx_path: Path, class_names: tuple[str, ...], samples: Sequence[tuple[Path, str]], input_size: int
 ) -> list[dict[str, object]]:
-    """Load `onnx_path` through the project's own `ClassifierDetector` and
-    classify each of `samples`. Returns one result dict per sample with the
-    true class (from its test-split subdirectory), the predicted class and
-    confidence (or `None` if the prediction was "normal", which
-    `postprocess_classify` always excludes), and `p_failure`.
-
-    Raises `AssertionError` if any confidence or `p_failure` value falls
-    outside `[0, 1]` -- the actual "sane probabilities" check.
-    """
     import cv2
 
     from argus.detectors.classifier import ClassifierDetector
@@ -262,6 +280,20 @@ def run_classifier_detector_sanity_check(
 # --------------------------------------------------------------------------
 
 
+# None main(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: None
+# Description: CLI entry point. Exports the classification checkpoint to ONNX, derives
+#              class_names from the checkpoint's own output-index order, copies the exported
+#              file to --out, verifies the raw output shape, runs the ClassifierDetector
+#              sanity check against real test images (skipped with a warning if none are
+#              found), and prints a combined verification report.
+# Side Effects: Raises FileNotFoundError if --weights doesn't exist; raises RuntimeError if the
+#               exported model has no `names` attribute; writes an ONNX file to disk via
+#               Ultralytics export; creates --out's parent directory and copies the exported
+#               file there (shutil.copy2); runs onnxruntime verification and (if test images
+#               exist) the real ClassifierDetector sanity check, which reads test images from
+#               disk; prints export progress and a verification report to stdout.
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
