@@ -1,17 +1,9 @@
-"""Record camera frames from a real print, for building a personal dataset.
+"""Record camera frames from a real print, for building a personal dataset
+to fine-tune the detector on this printer's actual camera/lighting/bed.
 
-This is the main lever for real-world accuracy: the shipped model is
-trained on a public dataset, but every printer's camera angle, lighting,
-and bed/plate look a little different. Running this during a real print
-(ideally several, covering both nominal prints and any real failures you
-witness) builds up a `datasets/raw`-shaped pile of frames to label and feed
-into `training/prepare_dataset.py` / `training/train.py` for fine-tuning.
-
-Frames are captured from `cfg.camera` (same config, same `build_source`
-dispatch, as the live service) at a fixed wall-clock interval and written
-as timestamped JPEGs into `--out`. Pass `--only-while-printing` to gate
-capture on Moonraker's print state so idle/homing/bed-mesh frames -- which
-are not what the detector needs to learn from -- don't dilute the dataset.
+Captures from `cfg.camera` at a fixed interval, writes timestamped JPEGs
+into `--out`. `--only-while-printing` gates capture on Moonraker's print
+state to skip idle/homing/bed-mesh frames.
 
 Usage:
     python tools/record.py --out datasets/captures/2026-09-01_benchy --interval 5
@@ -40,16 +32,26 @@ from argus.types import Frame
 logger = logging.getLogger("argus.tools.record")
 
 
+# str _frame_filename(float ts)
+# Inputs: float ts - unix timestamp (seconds) of the frame to name
+# Outputs: str - UTC-timestamped JPEG filename, millisecond precision
+# Description: Builds the on-disk filename for a captured frame from its capture timestamp,
+#              formatting it so filenames sort chronologically by name.
+# Side Effects: None
 def _frame_filename(ts: float) -> str:
-    """UTC-timestamped filename, millisecond precision, sortable by name."""
     dt = datetime.fromtimestamp(ts, tz=timezone.utc)
     return f"frame_{dt.strftime('%Y%m%dT%H%M%S')}_{dt.microsecond // 1000:03d}Z.jpg"
 
 
+# Optional[Path] _save_frame(Frame frame, Path out_dir)
+# Inputs: Frame frame   - captured frame (image + timestamp) to persist
+#         Path out_dir  - directory to write the JPEG into
+# Outputs: Optional[Path] - path to the written JPEG, or None if the write failed
+# Description: Writes a single frame to disk as a timestamped JPEG, tolerating and logging
+#              failures so one bad write never aborts a multi-hour recording session.
+# Side Effects: Creates `out_dir` (and parents) if missing; writes a JPEG file to disk; logs a
+#               warning or exception on failure.
 def _save_frame(frame: Frame, out_dir: Path) -> Optional[Path]:
-    """Write `frame` as a JPEG into `out_dir`. Returns the path, or None on
-    failure -- a single bad write must never abort a multi-hour recording
-    session."""
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / _frame_filename(frame.timestamp)
@@ -64,13 +66,24 @@ def _save_frame(frame: Frame, out_dir: Path) -> Optional[Path]:
 
 
 class _StopFlag:
-    """Small mutable holder so the SIGINT/SIGTERM handler can signal the
-    capture loop to stop after the current frame without module-level
-    global state."""
+    """Mutable holder so the SIGINT/SIGTERM handler can signal the capture
+    loop to stop, without module-level global state."""
 
+    # None __init__()
+    # Inputs: None
+    # Outputs: None
+    # Description: Initializes the mutable stop flag to False.
+    # Side Effects: None
     def __init__(self) -> None:
         self.stop = False
 
+    # None install_handlers()
+    # Inputs: None
+    # Outputs: None
+    # Description: Registers SIGINT/SIGTERM handlers that set `self.stop` so the capture loop
+    #              exits after finishing its current frame instead of terminating abruptly.
+    # Side Effects: Installs process-level signal handlers for SIGINT and SIGTERM (where
+    #               available); logs a debug message if a handler cannot be installed.
     def install_handlers(self) -> None:
         def _handler(signum: int, frame: Optional[FrameType]) -> None:
             logger.info("received signal %s, stopping after current frame", signum)
@@ -86,6 +99,13 @@ class _StopFlag:
                 logger.debug("could not install handler for %s", sig_name)
 
 
+# argparse.Namespace parse_args(Optional[list[str]] argv=None)
+# Inputs: Optional[list[str]] argv - command-line arguments to parse; defaults to None, which
+#                                    makes argparse read sys.argv
+# Outputs: argparse.Namespace - parsed CLI options (--config, --out, --interval, --max-frames,
+#                                --only-while-printing, --log-level)
+# Description: Defines and parses the command-line interface for the recording tool.
+# Side Effects: None
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Record camera frames at a fixed interval for dataset building.",
@@ -114,6 +134,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# None main(Optional[list[str]] argv=None)
+# Inputs: Optional[list[str]] argv - command-line arguments to parse; defaults to None (reads
+#                                    sys.argv)
+# Outputs: None
+# Description: Entry point that drives the recording loop -- builds the camera source (and
+#              optional Moonraker client), captures frames at a fixed interval (gated on print
+#              state when requested), saves them to disk, and logs a final summary.
+# Side Effects: Configures logging; opens the camera/HTTP video source and, when
+#               --only-while-printing is set, an HTTP connection to Moonraker; polls Moonraker
+#               for print state; writes JPEG frames to disk (via _save_frame); prints/logs
+#               progress and a final summary; sleeps between capture ticks; closes the camera
+#               source and Moonraker client on exit.
 def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
     logging.basicConfig(

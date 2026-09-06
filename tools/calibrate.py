@@ -1,42 +1,18 @@
-"""Measure false-positive rate and detection latency of the REAL
-`argus.decision.DecisionEngine` against recorded footage.
+"""Replay recorded footage through the REAL, shipping
+`argus.decision.DecisionEngine` (never a reimplementation) to measure
+false-positives/hour and time-to-detect -- the evidence for graduating
+`action_mode` from notify_only to pause.
 
-This never reimplements the decision logic -- the whole point is measuring
-the code that actually ships. Two input modes:
-
-  --frames DIR [DIR ...]   Replay a directory of image frames through a real
-                            detector (ONNX or, with --mock, MockDetector).
-                            Slow: inference runs once per frame.
-
-  --scores FILE [FILE ...] Replay a JSONL of previously-computed per-tick
-                            scores (produced by a prior --frames run with
-                            --scores-out). Fast: no inference, no frame
-                            decoding -- just DecisionEngine.tick() in a
-                            loop, so sweeping thresholds is cheap.
-
-Each input (one directory, or one JSONL file) is treated as one independent
-print "trace" (continuous timeline starting at warmup). Report:
-
-  - false positives per print-hour (the project's headline safety metric)
-  - total actions fired, broken down by NOTIFY/PAUSE/CANCEL
-  - mean time-to-detect, when --failure-start-tick marks a known failure
-    onset in every trace
-
---sweep varies pause_score / pause_votes / ema_alpha over a grid (each
-combo re-replays every trace against the SAME recorded scores -- no new
-inference), prints a ranked table, and recommends a `decision:` YAML block
--- the evidence needed before graduating from notify_only to pause.
+`--frames DIR...` scores a directory of images with a real/mock detector
+(slow, one inference per frame); `--scores FILE...` replays a cached
+per-tick JSONL from a prior `--scores-out` run (fast, no inference), so
+`--sweep` over pause_score/pause_votes/ema_alpha stays cheap.
 
 Usage:
-    # One-shot: build a score cache from a directory of frames, replay it.
     python tools/calibrate.py --frames datasets/captures/nominal_run1 \\
         --scores-out /tmp/nominal_run1.jsonl
-
-    # Fast re-sweep against a cached score file.
     python tools/calibrate.py --scores /tmp/nominal_run1.jsonl --sweep \\
         --sweep-pause-score 0.65,0.75,0.85 --sweep-pause-votes 4,6,8
-
-    # Time-to-detect against a trace with a known failure onset at tick 400.
     python tools/calibrate.py --scores /tmp/spaghetti_run1.jsonl \\
         --failure-start-tick 400
 """
@@ -80,16 +56,13 @@ _IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 _BASE_TS = 1_700_000_000.0
 
 
-# --------------------------------------------------------------------------
-# TickRecord: one frame's worth of pre-computed detector/gate output
-# --------------------------------------------------------------------------
+# -- TickRecord: one frame's worth of pre-computed detector/gate output --
 
 
 @dataclasses.dataclass(frozen=True)
 class TickRecord:
-    """One tick's detector + quality-gate output, decoupled from any
-    particular DecisionConfig -- what gets cached to/from a --scores JSONL
-    file so a threshold sweep never has to re-run inference."""
+    """One tick's detector + quality-gate output, cached to/from a
+    --scores JSONL so a threshold sweep never has to re-run inference."""
 
     tick: int
     timestamp: float
@@ -99,6 +72,12 @@ class TickRecord:
     detections: tuple[Detection, ...]
 
 
+# dict _detection_to_dict(Detection d)
+# Inputs: Detection d - a single detector output (class, confidence, bbox, severity) to serialize
+# Outputs: dict - JSON-serializable representation of `d`
+# Description: Converts a `Detection` into a plain dict suitable for JSONL serialization to a
+#              --scores cache file.
+# Side Effects: None
 def _detection_to_dict(d: Detection) -> dict:
     return {
         "class_id": d.class_id,
@@ -109,6 +88,13 @@ def _detection_to_dict(d: Detection) -> dict:
     }
 
 
+# Detection _detection_from_dict(dict d)
+# Inputs: dict d - a detection dict as produced by `_detection_to_dict` / loaded from a scores
+#                  JSONL line
+# Outputs: Detection - reconstructed detection object
+# Description: Inverse of `_detection_to_dict`; rebuilds a `Detection` from its serialized dict
+#              form when loading a cached --scores file.
+# Side Effects: None
 def _detection_from_dict(d: dict) -> Detection:
     return Detection(
         class_id=int(d["class_id"]),
@@ -119,6 +105,11 @@ def _detection_from_dict(d: dict) -> Detection:
     )
 
 
+# dict _record_to_dict(TickRecord r)
+# Inputs: TickRecord r - one tick's detector/gate output to serialize
+# Outputs: dict - JSON-serializable representation of `r`, including its nested detections
+# Description: Converts a `TickRecord` into a plain dict for writing to a --scores JSONL cache.
+# Side Effects: None
 def _record_to_dict(r: TickRecord) -> dict:
     return {
         "tick": r.tick,
@@ -130,6 +121,14 @@ def _record_to_dict(r: TickRecord) -> dict:
     }
 
 
+# TickRecord _record_from_dict(dict d)
+# Inputs: dict d - a tick-record dict as produced by `_record_to_dict` / parsed from a scores
+#                  JSONL line
+# Outputs: TickRecord - reconstructed tick record
+# Description: Inverse of `_record_to_dict`; rebuilds a `TickRecord` from its serialized dict
+#              form, defaulting missing optional fields (`gate_passed`, `gate_reason`,
+#              `detections`).
+# Side Effects: None
 def _record_from_dict(d: dict) -> TickRecord:
     return TickRecord(
         tick=int(d["tick"]),
@@ -141,6 +140,15 @@ def _record_from_dict(d: dict) -> TickRecord:
     )
 
 
+# None write_scores(Sequence[TickRecord] records, Path path)
+# Inputs: Sequence[TickRecord] records - tick records to persist, in order
+#         Path path                   - destination JSONL file
+# Outputs: None
+# Description: Serializes `records` to a newline-delimited JSON (JSONL) file so a later run can
+#              replay the same scores through the DecisionEngine without re-running inference --
+#              the mechanism that makes threshold sweeps cheap.
+# Side Effects: Creates `path`'s parent directory if missing; creates or overwrites the file at
+#               `path`; writes one JSON line per record.
 def write_scores(records: Sequence[TickRecord], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -148,6 +156,12 @@ def write_scores(records: Sequence[TickRecord], path: Path) -> None:
             f.write(json.dumps(_record_to_dict(r)) + "\n")
 
 
+# list[TickRecord] load_scores(Path path)
+# Inputs: Path path - JSONL file previously written by `write_scores`
+# Outputs: list[TickRecord] - the tick records read from the file, in file order
+# Description: Reads a cached --scores JSONL file back into `TickRecord`s for replay, raising a
+#              descriptive error if a line is malformed.
+# Side Effects: Reads the file at `path` from disk.
 def load_scores(path: Path) -> list[TickRecord]:
     records: list[TickRecord] = []
     with open(path, "r", encoding="utf-8") as f:
@@ -162,30 +176,46 @@ def load_scores(path: Path) -> list[TickRecord]:
     return records
 
 
-# --------------------------------------------------------------------------
-# Computing TickRecords from a directory of frames (runs inference once)
-# --------------------------------------------------------------------------
+# -- Computing TickRecords from a directory of frames (runs inference once) --
 
 
+# list[Path] _list_image_files(Path directory)
+# Inputs: Path directory - directory to scan for candidate frame images
+# Outputs: list[Path] - image files in `directory` (.jpg/.jpeg/.png) sorted by filename
+# Description: Lists the image files in `directory` in the sorted order that determines
+#              frame/tick ordering for scoring.
+# Side Effects: Reads the directory listing from disk.
 def _list_image_files(directory: Path) -> list[Path]:
     return sorted(
         p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in _IMAGE_EXTENSIONS
     )
 
 
+# list[TickRecord] compute_scores_from_frames(Path directory, Detector detector, Config cfg,
+#                                              float tick_interval_s)
+# Inputs: Path directory       - directory of frame images to score, in sorted filename order
+#         Detector detector    - real (ONNX) or MockDetector instance to run inference with
+#         Config cfg           - full app config; only `cfg.quality` (quality gate thresholds)
+#                                 is used here
+#         float tick_interval_s - synthetic seconds between ticks, used to fabricate frame
+#                                 timestamps
+# Outputs: list[TickRecord] - one TickRecord per successfully-read frame, in order
+# Description: Runs the real quality gate and detector once per frame in `directory` to build
+#              the per-tick evidence (p_failure, gate pass/fail, detections) that calibration and
+#              threshold sweeps are based on -- this is the (slow, one inference per frame)
+#              score-computation half of measuring whether automated pausing is safe to enable.
+# Side Effects: Reads image files from disk (via cv2.imread); runs detector inference (may use
+#               GPU/CPU compute); logs a warning per unreadable image and periodic progress every
+#               100 frames.
 def compute_scores_from_frames(
     directory: Path,
     detector: Detector,
     cfg: Config,
     tick_interval_s: float,
 ) -> list[TickRecord]:
-    """Run the quality gate + detector once per frame in `directory` (sorted
-    filename order) and return one `TickRecord` per frame.
-
-    Frame timestamps are synthetic (`_BASE_TS + tick * tick_interval_s`),
-    not file mtimes, so the quality gate's staleness check never spuriously
-    trips during replay regardless of how long computing scores takes.
-    """
+    """Frame timestamps are synthetic (`_BASE_TS + tick * tick_interval_s`),
+    not file mtimes, so the quality gate's staleness check can't spuriously
+    trip regardless of how long computing scores takes."""
     files = _list_image_files(directory)
     if not files:
         raise ValueError(f"no image files ({_IMAGE_EXTENSIONS}) found in '{directory}'")
@@ -222,9 +252,7 @@ def compute_scores_from_frames(
     return records
 
 
-# --------------------------------------------------------------------------
-# Replaying TickRecords through the REAL DecisionEngine
-# --------------------------------------------------------------------------
+# -- Replaying TickRecords through the REAL DecisionEngine --
 
 
 @dataclasses.dataclass(frozen=True)
@@ -237,25 +265,28 @@ class TraceResult:
     detected: Optional[bool]  # None if no failure_start_tick was given
 
 
+# TraceResult replay_trace(Sequence[TickRecord] records, DecisionConfig decision_cfg,
+#                          Optional[int] failure_start_tick=None)
+# Inputs: Sequence[TickRecord] records    - one trace's pre-computed per-tick scores, in tick
+#                                           order
+#         DecisionConfig decision_cfg     - the decision thresholds/mode to replay against
+#         Optional[int] failure_start_tick - tick at which a real failure begins, if known;
+#                                           None means the trace is treated as entirely nominal
+# Outputs: TraceResult - per-trace tallies (actions fired, false positives, time-to-detect) from
+#                        replaying against a real DecisionEngine
+# Description: Drives a fresh, real `DecisionEngine` tick-by-tick over one trace's cached scores,
+#              classifying each fired action as a false positive or (once a known failure has
+#              started) the true detection -- this is the core measurement that calibrates
+#              whether action_mode may graduate from notify_only to pause.
+# Side Effects: None (pure replay against an in-memory DecisionEngine; no I/O)
 def replay_trace(
     records: Sequence[TickRecord],
     decision_cfg: DecisionConfig,
     failure_start_tick: Optional[int] = None,
 ) -> TraceResult:
-    """Feed `records` through a fresh `DecisionEngine(decision_cfg)`, one
-    tick at a time, exactly as `ArgusService.run_once` would (synthesizing
-    a continuously-PRINTING `PrintState` since recorded footage has no
-    Moonraker to poll).
-
-    Action classification when `failure_start_tick` is given: any action at
-    a tick before it is a false positive (the failure hadn't started yet);
-    the first action at or after it is the true detection (used for
-    time-to-detect); any further actions after that first true detection
-    are neither -- they're the engine continuing to react to the same
-    still-ongoing real failure, not a fresh false alarm. With no
-    `failure_start_tick`, the trace is assumed entirely nominal, so every
-    fired action is a false positive.
-    """
+    """Actions before `failure_start_tick` are false positives; the first
+    at/after it is the true detection; later ones are the engine still
+    reacting to that same failure, not fresh alarms."""
     engine = DecisionEngine(decision_cfg)
     if not records:
         return TraceResult(
@@ -325,6 +356,14 @@ class AggregateResult:
     detected_fraction: Optional[float]
 
 
+# AggregateResult aggregate(Sequence[TraceResult] results)
+# Inputs: Sequence[TraceResult] results - one TraceResult per replayed trace
+# Outputs: AggregateResult - totals and rates (false positives/hour, actions by type, mean
+#                            time-to-detect, detected fraction) across all traces
+# Description: Combines per-trace replay results into the headline safety metrics -- most
+#              importantly false-positives-per-print-hour -- used to judge whether a given
+#              decision configuration is safe enough to enable automated pausing.
+# Side Effects: None
 def aggregate(results: Sequence[TraceResult]) -> AggregateResult:
     total_ticks = sum(r.n_ticks for r in results)
     total_hours = sum(r.duration_s for r in results) / 3600.0
@@ -357,12 +396,27 @@ def aggregate(results: Sequence[TraceResult]) -> AggregateResult:
     )
 
 
+# str _fmt_ttd(Optional[float] seconds)
+# Inputs: Optional[float] seconds - a time-to-detect duration, or None if not applicable
+# Outputs: str - "n/a" or the duration formatted as e.g. "12.3s"
+# Description: Formats an optional time-to-detect value for display in reports and sweep tables.
+# Side Effects: None
 def _fmt_ttd(seconds: Optional[float]) -> str:
     if seconds is None:
         return "n/a"
     return f"{seconds:.1f}s"
 
 
+# None print_report(AggregateResult agg, Optional[int] failure_start_tick)
+# Inputs: AggregateResult agg              - aggregated replay metrics to display
+#         Optional[int] failure_start_tick - whether a known failure onset was configured;
+#                                            controls whether time-to-detect/detected-fraction
+#                                            lines are shown
+# Outputs: None
+# Description: Prints the single-run calibration report to stdout, headlined by
+#              false-positives-per-hour -- the figure used to decide whether automated pausing
+#              may be enabled.
+# Side Effects: Prints the calibration report to stdout.
 def print_report(agg: AggregateResult, failure_start_tick: Optional[int]) -> None:
     print("=" * 72)
     print("CALIBRATION REPORT")
@@ -380,17 +434,31 @@ def print_report(agg: AggregateResult, failure_start_tick: Optional[int]) -> Non
     print("=" * 72)
 
 
-# --------------------------------------------------------------------------
-# Sweep mode
-# --------------------------------------------------------------------------
+# -- Sweep mode --
 
 
+# list[float] _parse_float_grid(Optional[str] spec, float fallback)
+# Inputs: Optional[str] spec - comma-separated float values (e.g. a --sweep-* CLI argument), or
+#                              None
+#         float fallback     - value to use when `spec` is None/empty
+# Outputs: list[float] - parsed grid values, or `[fallback]` if none were given
+# Description: Parses a comma-separated CLI grid argument into a list of floats for use as one
+#              axis of the threshold sweep.
+# Side Effects: None
 def _parse_float_grid(spec: Optional[str], fallback: float) -> list[float]:
     if not spec:
         return [fallback]
     return [float(x) for x in spec.split(",") if x.strip()]
 
 
+# list[int] _parse_int_grid(Optional[str] spec, int fallback)
+# Inputs: Optional[str] spec - comma-separated integer values (e.g. a --sweep-* CLI argument),
+#                              or None
+#         int fallback       - value to use when `spec` is None/empty
+# Outputs: list[int] - parsed grid values, or `[fallback]` if none were given
+# Description: Parses a comma-separated CLI grid argument into a list of ints for use as one
+#              axis of the threshold sweep.
+# Side Effects: None
 def _parse_int_grid(spec: Optional[str], fallback: int) -> list[int]:
     if not spec:
         return [fallback]
@@ -405,6 +473,24 @@ class SweepRow:
     agg: AggregateResult
 
 
+# list[SweepRow] run_sweep(Sequence[Sequence[TickRecord]] traces,
+#                          DecisionConfig base_decision_cfg, Sequence[float] pause_scores,
+#                          Sequence[int] pause_votes_grid, Sequence[float] ema_alphas,
+#                          Optional[int] failure_start_tick)
+# Inputs: Sequence[Sequence[TickRecord]] traces - cached per-tick scores for each trace to replay
+#         DecisionConfig base_decision_cfg      - decision config to vary (pause_score/
+#                                                 pause_votes/ema_alpha overridden per combo)
+#         Sequence[float] pause_scores          - pause_score grid values to sweep
+#         Sequence[int] pause_votes_grid        - pause_votes grid values to sweep
+#         Sequence[float] ema_alphas            - ema_alpha grid values to sweep
+#         Optional[int] failure_start_tick      - known failure onset tick, applied per trace,
+#                                                 or None
+# Outputs: list[SweepRow] - one row (config + aggregated metrics) per combination in the grid
+# Description: Re-replays every trace's cached scores against every combination of
+#              pause_score/pause_votes/ema_alpha (no new inference), building the ranked
+#              evidence used to recommend a decision: config for graduating from notify_only to
+#              pause.
+# Side Effects: None (replays against in-memory DecisionEngine instances only; no I/O)
 def run_sweep(
     traces: Sequence[Sequence[TickRecord]],
     base_decision_cfg: DecisionConfig,
@@ -423,6 +509,16 @@ def run_sweep(
     return rows
 
 
+# None print_sweep_table(Sequence[SweepRow] rows, Optional[int] failure_start_tick)
+# Inputs: Sequence[SweepRow] rows          - sweep results to display, one per grid combination
+#         Optional[int] failure_start_tick - whether time-to-detect should be shown in the
+#                                            recommendation
+# Outputs: None
+# Description: Prints the ranked sweep table (lowest FP/hour first, then fastest
+#              time-to-detect) and a recommended `decision:` YAML block -- the evidence a
+#              maintainer uses to decide whether automated pausing is safe to enable, with an
+#              explicit warning when no grid point reaches zero FP/hour.
+# Side Effects: Prints the sweep table and recommendation to stdout.
 def print_sweep_table(rows: Sequence[SweepRow], failure_start_tick: Optional[int]) -> None:
     ranked = sorted(
         rows,
@@ -462,11 +558,17 @@ def print_sweep_table(rows: Sequence[SweepRow], failure_start_tick: Optional[int
         )
 
 
-# --------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------
+# -- CLI --
 
 
+# argparse.Namespace parse_args(Optional[list[str]] argv=None)
+# Inputs: Optional[list[str]] argv - command-line arguments to parse; defaults to None, which
+#                                    makes argparse read sys.argv
+# Outputs: argparse.Namespace - parsed CLI options (--frames, --scores, --scores-out, --model,
+#                                --mock, --tick-interval-s, --failure-start-tick, --action-mode,
+#                                --cancel-enabled, --sweep and sweep grids, --log-level)
+# Description: Defines and parses the command-line interface for the calibration tool.
+# Side Effects: None
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Replay recorded footage through the real DecisionEngine to measure "
@@ -514,6 +616,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# DecisionConfig _build_decision_cfg(Config cfg, argparse.Namespace args)
+# Inputs: Config cfg              - loaded app config supplying the base `decision` section
+#         argparse.Namespace args - parsed CLI args (`action_mode`, `cancel_enabled`,
+#                                   `tick_interval_s`) to overlay
+# Outputs: DecisionConfig - `cfg.decision` with CLI overrides applied
+# Description: Builds the DecisionConfig to replay against by overlaying the requested
+#              --action-mode (and optional --cancel-enabled/--tick-interval-s overrides) onto
+#              the loaded config's decision section.
+# Side Effects: None
 def _build_decision_cfg(cfg: Config, args: argparse.Namespace) -> DecisionConfig:
     from argus.types import ActionMode
 
@@ -525,6 +636,20 @@ def _build_decision_cfg(cfg: Config, args: argparse.Namespace) -> DecisionConfig
     return dataclasses.replace(cfg.decision, **overrides)
 
 
+# None main(Optional[list[str]] argv=None)
+# Inputs: Optional[list[str]] argv - command-line arguments to parse; defaults to None (reads
+#                                    sys.argv)
+# Outputs: None
+# Description: Entry point that loads config, builds/loads traces from --frames and/or
+#              --scores, then either runs a threshold sweep or a single replay against the real
+#              DecisionEngine and prints the resulting report -- the end-to-end tool for
+#              producing the false-positives-per-hour and time-to-detect evidence used to decide
+#              whether automated pausing may be enabled.
+# Side Effects: Configures logging; when --frames is given, constructs a real detector (ONNX or
+#               Mock), reads frame images from disk, runs inference, and (with --scores-out)
+#               writes a scores JSONL file to disk; when --scores is given, reads JSONL files
+#               from disk; prints the calibration report or sweep table to stdout; may raise
+#               SystemExit on invalid argument combinations.
 def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
     logging.basicConfig(

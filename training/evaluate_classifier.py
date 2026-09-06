@@ -1,67 +1,8 @@
-"""Evaluate a trained 6-class print-failure classifier on the held-out TEST
-split and quantify the numbers that actually matter operationally: the
-false-positive rate on healthy prints, and the precision of the ONE
-class allowed to stop a print automatically (``spaghetti`` -- see
-``config.example.yaml``'s ``severity`` mapping under the commented-out
-classification block; every other defect class is cosmetic-only and
-``normal`` never emits a detection at all, see
-``argus.detectors.classifier.postprocess_classify``).
+"""Evaluates a trained 6-class classifier on ``--split`` (default test): overall accuracy and per-class P/R/F1, the confusion matrix, a binary normal-vs-defect collapse with false-positive rate, the real runtime ``p_failure`` threshold sweep for ``spaghetti`` (the only class allowed to auto-pause a print), and a source-confound diagnostic splitting spaghetti recall by dataset origin (this dataset's ``normal`` is 100% Hugging Face while other defects are ~100% FDM; ``spaghetti`` is the one class mixed across both).
 
-This dataset has a documented source confound (see
-``datasets/argus_cls/split_report.json``'s ``confound_warning`` and
-``training/build_classification_dataset.py``'s module docstring):
-``normal`` comes 100% from a Hugging Face dataset while the four FDM-only
-defect classes (and most of ``spaghetti``) come 100% from a fixed-camera FDM
-rig. ``spaghetti`` is the ONLY class mixed across both sources, which makes
-it the one class where "does the model recognize the defect" and "does the
-model recognize which dataset this came from" can be told apart empirically
--- analysis 5 below (SOURCE-CONFOUND DIAGNOSTIC) does exactly that.
+``--min-recall`` rejects the vacuous "precision=1.0 at ~zero recall" convention: a threshold so high the model almost never fires trivially has no false positives and no real value. Ultralytics assigns class indices alphabetically, not the human-readable order used for reporting here -- a mismatch is flagged loudly since ``ClassifierDetector`` trusts ``cfg.class_names`` to match the model's real order.
 
-Five analyses, run once each over a single inference pass on ``--split``:
-  1. Overall top-1 accuracy, and per-class precision/recall/F1/support.
-  2. The full 6x6 confusion matrix, printed with class names.
-  3. A binary "normal vs defect" collapse -- precision/recall/F1 for the
-     positive class "defect" and a 2x2 matrix, including the plain
-     false-positive rate (of truly-normal images, how many get called some
-     defect).
-  4. The REAL runtime catastrophic-path rule -- ``p_failure`` is driven
-     solely by the ``spaghetti`` probability, and only when ``spaghetti`` is
-     the model's own argmax prediction AND that probability clears a
-     confidence threshold (see ``argus.detectors.classifier.
-     postprocess_classify``: a non-argmax class's probability, however
-     high, never reaches ``DetectionResult.p_failure``, and neither does an
-     argmax ``spaghetti`` prediction below threshold). This mirrors
-     ``training/evaluate.py``'s confidence-threshold sweep and its
-     near-zero-recall "vacuous precision" guard (read that file's
-     ``find_lowest_threshold_for_precision`` -- the logic and wording here
-     are deliberately the same).
-  5. SOURCE-CONFOUND DIAGNOSTIC (the most important check here): spaghetti
-     recall computed separately for FDM-sourced vs argus_v2-sourced test
-     images. Provenance is recovered from the output filename convention
-     ``training/build_classification_dataset.py`` actually writes
-     (``fdm_<class>_<stem>.jpg`` / ``argus_v2_<stem>.jpg`` /
-     ``hf_normal_<split>_<idx>.jpg`` -- see that module's ``fdm_candidates``
-     / ``argus_spaghetti_candidates`` / ``hf_normal_candidates``). A test
-     image whose filename doesn't match either prefix is counted as
-     "unknown provenance" and reported as such rather than guessed at.
-
-A note on class ORDER: Ultralytics assigns classification output indices
-alphabetically from the training folder names (``cracking``,
-``layer_shifting``, ``normal``, ``spaghetti``, ``stringing``, ``warping``),
-NOT the "normal, spaghetti, cracking, layer_shifting, stringing, warping"
-order this docstring (and config.example.yaml's commented-out
-``class_names`` list) writes them in for readability. This script never
-assumes an index order -- it reads ``model.names`` off the loaded checkpoint
-and works by class NAME throughout -- but it checks the two orders against
-each other and flags a mismatch loudly in the report, because
-``ClassifierDetector`` (src/argus/detectors/classifier.py) *does* trust
-``cfg.class_names`` to be in the model's actual output-index order. Wiring
-up config.example.yaml's classification block with the human-readable order
-as literally written would silently mislabel every prediction.
-
-Usage:
-    python training/evaluate_classifier.py --weights runs/train/cls_v1/weights/best.pt
-    python training/evaluate_classifier.py --weights ... --split test --target-precision 0.95
+Usage: python training/evaluate_classifier.py --weights <best.pt> [--split test] [--target-precision 0.95]
 """
 
 from __future__ import annotations
@@ -80,11 +21,8 @@ DEFAULT_WEIGHTS = REPO_ROOT / "runs" / "train" / "cls_v1" / "weights" / "best.pt
 DEFAULT_DATA_DIR = REPO_ROOT / "datasets" / "argus_cls"
 DEFAULT_OUT_PATH = REPO_ROOT / "runs" / "classifier_evaluation.json"
 
-#: Class order used for all human-facing output (report, confusion matrix,
-#: JSON) -- matches datasets/argus_cls/split_report.json's "class_names" and
-#: config.example.yaml's commented-out classification class_names list. NOT
-#: assumed to be the model's actual output-index order -- see module
-#: docstring's class-order note and `check_class_order_matches_model`.
+#: Human-readable class order for reporting only -- NOT assumed to be the model's actual
+#: output-index order (Ultralytics orders alphabetically; see check_class_order_matches_model).
 REPORT_CLASS_ORDER: tuple[str, ...] = ("normal", "spaghetti", "cracking", "layer_shifting", "stringing", "warping")
 
 NORMAL_CLASS_NAME = "normal"
@@ -95,12 +33,8 @@ CATASTROPHIC_CLASS_NAME = "spaghetti"
 
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png")
 
-#: Output filename prefixes training/build_classification_dataset.py
-#: actually writes (see fdm_candidates/argus_spaghetti_candidates/
-#: hf_normal_candidates' `output_stem` construction) -- used to recover each
-#: test image's source dataset for the SOURCE-CONFOUND DIAGNOSTIC. Order
-#: matters only in that these must stay mutually exclusive prefixes, which
-#: they are by construction.
+#: Output filename prefixes build_classification_dataset.py writes, used to recover each
+#: test image's source for the source-confound diagnostic.
 _SOURCE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("fdm_", "fdm"),
     ("argus_v2_", "argus_v2"),
@@ -108,11 +42,16 @@ _SOURCE_PREFIXES: tuple[tuple[str, str], ...] = (
 )
 
 
+# str infer_source(str filename)
+# Inputs: str filename - a test-split image filename
+# Outputs: str - "fdm", "argus_v2", "hf", or "unknown" if no known prefix matches
+# Description: Recovers a test image's source dataset from its output filename prefix
+#              (_SOURCE_PREFIXES, matching what training/build_classification_dataset.py
+#              actually writes). Used by the SOURCE-CONFOUND DIAGNOSTIC (analysis 5) to split
+#              spaghetti recall by dataset origin. Returns "unknown" rather than guessing when
+#              no prefix matches, so callers must report that explicitly.
+# Side Effects: None
 def infer_source(filename: str) -> str:
-    """Recover a test image's source dataset from its output filename
-    prefix (see `_SOURCE_PREFIXES`). Returns "unknown" if the filename
-    matches none of them -- callers must report that explicitly rather than
-    guessing which source an unrecognized file came from."""
     for prefix, source in _SOURCE_PREFIXES:
         if filename.startswith(prefix):
             return source
@@ -121,16 +60,21 @@ def infer_source(filename: str) -> str:
 
 # --------------------------------------------------------------------------
 # Pure functions -- confusion matrix, per-class metrics, binary collapse.
-# Operate on plain class-NAME sequences (never raw model indices), so they
-# are fully testable with synthetic data and no model/GPU.
 # --------------------------------------------------------------------------
 
 
+# np.ndarray build_confusion_matrix(Sequence[str] y_true, Sequence[str] y_pred, Sequence[str] class_order)
+# Inputs: Sequence[str] y_true - true class name per sample
+#         Sequence[str] y_pred - predicted class name per sample, same length as y_true
+#         Sequence[str] class_order - class names defining row/column order of the matrix
+# Outputs: np.ndarray - len(class_order) x len(class_order) int64 matrix, rows = true class,
+#          cols = predicted class, both indexed by position in class_order
+# Description: Builds a confusion matrix from parallel true/predicted class-name sequences.
+#              Operates on plain class names (never raw model indices), so it's testable with
+#              synthetic data and no model/GPU.
+# Side Effects: Raises ValueError if y_true and y_pred differ in length; raises KeyError (via
+#               the underlying dict lookup) if a label isn't present in class_order.
 def build_confusion_matrix(y_true: Sequence[str], y_pred: Sequence[str], class_order: Sequence[str]) -> np.ndarray:
-    """Build an ``len(class_order) x len(class_order)`` confusion matrix,
-    rows = true class, cols = predicted class, both indexed by position in
-    `class_order`. Raises `KeyError` (via the underlying dict lookup) if a
-    label in `y_true`/`y_pred` isn't present in `class_order`."""
     if len(y_true) != len(y_pred):
         raise ValueError(f"y_true and y_pred must be the same length, got {len(y_true)} vs {len(y_pred)}")
     index = {name: i for i, name in enumerate(class_order)}
@@ -141,25 +85,32 @@ def build_confusion_matrix(y_true: Sequence[str], y_pred: Sequence[str], class_o
     return cm
 
 
+# float top1_accuracy(np.ndarray cm)
+# Inputs: np.ndarray cm - confusion matrix from build_confusion_matrix
+# Outputs: float - overall top-1 accuracy (trace / total), or 0.0 if the matrix is empty
+# Description: Computes overall top-1 accuracy from a confusion matrix: trace / total.
+# Side Effects: None
 def top1_accuracy(cm: np.ndarray) -> float:
-    """Overall top-1 accuracy from a confusion matrix: trace / total."""
     total = int(cm.sum())
     if total == 0:
         return 0.0
     return float(np.trace(cm)) / total
 
 
+# dict[str, dict[str, float | int]] per_class_prf1(np.ndarray cm, Sequence[str] class_order)
+# Inputs: np.ndarray cm - confusion matrix from build_confusion_matrix
+#         Sequence[str] class_order - class names matching cm's row/column order
+# Outputs: dict[str, dict[str, float | int]] - per class name: precision, recall, f1, support
+#          (true instance count), predicted_count
+# Description: Computes per-class precision/recall/F1/support from a confusion matrix built
+#              over the same class_order. Precision for a class with zero predictions, and
+#              recall for a class with zero true instances, are both reported as 0.0 (rather
+#              than raising or reporting NaN) -- a class the model never predicts at all is a
+#              real, reportable failure mode, not an error.
+# Side Effects: None
 def per_class_prf1(cm: np.ndarray, class_order: Sequence[str]) -> dict[str, dict[str, float | int]]:
-    """Per-class precision/recall/F1/support from a confusion matrix built
-    by `build_confusion_matrix` over the same `class_order`.
-
-    Precision for a class with zero predictions, and recall for a class
-    with zero true instances, are both reported as `0.0` (rather than
-    raising or reporting NaN) -- neither case is expected on this dataset's
-    test split (every class has test instances, see
-    datasets/argus_cls/split_report.json), but a class that the model never
-    predicts at all is a real, reportable failure mode, not an error.
-    """
+    """Zero-prediction precision and zero-support recall are reported as 0.0, not NaN --
+    a class the model never predicts is a real failure mode, not an error."""
     n = cm.shape[0]
     out: dict[str, dict[str, float | int]] = {}
     for i, name in enumerate(class_order):
@@ -179,17 +130,30 @@ def per_class_prf1(cm: np.ndarray, class_order: Sequence[str]) -> dict[str, dict
     return out
 
 
+# list[str] binary_labels(Sequence[str] names, str normal_name)
+# Inputs: Sequence[str] names - 6-way class names to collapse
+#         str normal_name - the class name treated as "normal", default NORMAL_CLASS_NAME
+#         ("normal"); matched case-insensitively after stripping
+# Outputs: list[str] - "normal" or "defect" for each input name
+# Description: Collapses a sequence of 6-way class names into a binary "normal"/"defect" label
+#              sequence, for the analysis-3 binary collapse.
+# Side Effects: None
 def binary_labels(names: Sequence[str], normal_name: str = NORMAL_CLASS_NAME) -> list[str]:
-    """Collapse a sequence of 6-way class names into "normal" / "defect"."""
     normal_name = normal_name.strip().lower()
     return ["normal" if n.strip().lower() == normal_name else "defect" for n in names]
 
 
+# dict[str, object] binary_metrics(Sequence[str] y_true_bin, Sequence[str] y_pred_bin)
+# Inputs: Sequence[str] y_true_bin - true "normal"/"defect" labels (from binary_labels)
+#         Sequence[str] y_pred_bin - predicted "normal"/"defect" labels, same length
+# Outputs: dict[str, object] - positive_class ("defect"), precision, recall, f1, a
+#          confusion_matrix dict (tp, fp, fn, tn), num_normal, num_defect, and
+#          false_positive_rate (of truly-normal images, fraction called some defect)
+# Description: Computes precision/recall/F1 for the positive class "defect", a 2x2 confusion
+#              matrix, and the plain false-positive rate -- the metric that actually determines
+#              how often a healthy print gets flagged.
+# Side Effects: None
 def binary_metrics(y_true_bin: Sequence[str], y_pred_bin: Sequence[str]) -> dict[str, object]:
-    """Precision/recall/F1 for the positive class "defect", a 2x2 confusion
-    matrix, and the plain false-positive rate (of truly-normal images, the
-    fraction called some defect) -- the metric that actually determines how
-    often a healthy print gets flagged."""
     tp = sum(1 for t, p in zip(y_true_bin, y_pred_bin) if t == "defect" and p == "defect")
     fp = sum(1 for t, p in zip(y_true_bin, y_pred_bin) if t == "normal" and p == "defect")
     fn = sum(1 for t, p in zip(y_true_bin, y_pred_bin) if t == "defect" and p == "normal")
@@ -214,53 +178,55 @@ def binary_metrics(y_true_bin: Sequence[str], y_pred_bin: Sequence[str]) -> dict
 
 # --------------------------------------------------------------------------
 # Pure functions -- the p_failure / catastrophic-path threshold sweep.
-# Mirrors training/evaluate.py's sweep_thresholds /
-# find_lowest_threshold_for_precision / best_supported_point, including its
-# "vacuous precision" convention: a threshold with zero surviving positive
-# predictions reports precision=1.0 by convention (matching Ultralytics'
-# own ap_per_class fill), which is statistically meaningless on its own --
-# hence the min_recall floor below.
+# Mirrors training/evaluate.py's sweep functions, including the min_recall
+# floor against the vacuous precision=1.0-at-zero-predictions convention.
 # --------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class CatastrophicRecord:
-    """One test image's relevant fields for the catastrophic-path sweep.
-
-    `catastrophic_prob` is the model's predicted probability of
-    `CATASTROPHIC_CLASS_NAME` ("spaghetti") specifically -- NOT necessarily
-    the model's top prediction. `is_argmax` records whether "spaghetti" was
-    in fact the model's argmax (top-1) prediction, since the real runtime
-    rule (`argus.detectors.classifier.postprocess_classify`) only ever
-    emits a detection for the argmax class: a high spaghetti probability on
-    an image the model actually predicted as some OTHER class can never
-    drive p_failure, no matter how high that probability is.
-    """
+    """`is_argmax` matters because the runtime rule only ever fires for the argmax class --
+    a high spaghetti probability on an image predicted as something else can't drive p_failure."""
 
     true_name: str
     is_argmax: bool
     catastrophic_prob: float
 
 
+# list[float] sweep_thresholds(float start, float end, float step)
+# Inputs: float start - first confidence threshold in the sweep
+#         float end - last confidence threshold in the sweep (inclusive)
+#         float step - increment between thresholds
+# Outputs: list[float] - confidence thresholds from start to end (inclusive) in steps of step,
+#          rounded to 10 decimal places to avoid float accumulation artifacts
+# Description: Builds the confidence-threshold sweep list; identical to
+#              training/evaluate.py's sweep_thresholds.
+# Side Effects: None
 def sweep_thresholds(start: float, end: float, step: float) -> list[float]:
     """Identical to training/evaluate.py's `sweep_thresholds`."""
     n_steps = int(round((end - start) / step)) + 1
     return [round(start + i * step, 10) for i in range(n_steps) if start + i * step <= end + 1e-9]
 
 
+# dict[str, float | int] evaluate_catastrophic_threshold(Sequence[CatastrophicRecord] records, float threshold, str catastrophic_name)
+# Inputs: Sequence[CatastrophicRecord] records - one CatastrophicRecord per test image
+#         float threshold - confidence threshold to evaluate
+#         str catastrophic_name - the catastrophic class name, default CATASTROPHIC_CLASS_NAME
+#         ("spaghetti")
+# Outputs: dict[str, float | int] - threshold, precision, recall, tp, fp, fn, tn at this
+#          threshold
+# Description: Computes precision/recall of the REAL runtime catastrophic-path rule at one
+#              confidence threshold: a record counts as a positive prediction iff its argmax
+#              class is catastrophic_name AND catastrophic_prob >= threshold (mirroring
+#              argus.detectors.classifier.postprocess_classify's actual gating). Precision when
+#              zero predictions survive at this threshold is reported as 1.0 -- the same
+#              vacuous-but-conventional fill training/evaluate.py uses (matching Ultralytics'
+#              ap_per_class), which is why find_lowest_threshold_for_precision's min_recall
+#              floor exists.
+# Side Effects: None
 def evaluate_catastrophic_threshold(
     records: Sequence[CatastrophicRecord], threshold: float, catastrophic_name: str = CATASTROPHIC_CLASS_NAME
 ) -> dict[str, float | int]:
-    """Precision/recall of the REAL runtime catastrophic-path rule at one
-    confidence `threshold`: a record counts as a positive prediction iff
-    its argmax class is `catastrophic_name` AND `catastrophic_prob >=
-    threshold` (see `CatastrophicRecord` docstring).
-
-    Precision when zero predictions survive at this threshold is reported
-    as `1.0` -- the same vacuous-but-conventional fill training/evaluate.py
-    uses (matching Ultralytics' ap_per_class), which is exactly why
-    `find_lowest_threshold_for_precision`'s `min_recall` floor exists below.
-    """
     tp = fp = fn = tn = 0
     for r in records:
         is_true = r.true_name == catastrophic_name
@@ -279,31 +245,44 @@ def evaluate_catastrophic_threshold(
     return {"threshold": threshold, "precision": precision, "recall": recall, "tp": tp, "fp": fp, "fn": fn, "tn": tn}
 
 
+# list[dict[str, float | int]] sweep_catastrophic(Sequence[CatastrophicRecord] records, Sequence[float] thresholds, str catastrophic_name)
+# Inputs: Sequence[CatastrophicRecord] records - one CatastrophicRecord per test image
+#         Sequence[float] thresholds - confidence thresholds to evaluate (from sweep_thresholds)
+#         str catastrophic_name - the catastrophic class name, default CATASTROPHIC_CLASS_NAME
+#         ("spaghetti")
+# Outputs: list[dict[str, float | int]] - evaluate_catastrophic_threshold's result for each
+#          threshold, in the same order
+# Description: Evaluates the catastrophic-path rule at every threshold in thresholds.
+# Side Effects: None
 def sweep_catastrophic(
     records: Sequence[CatastrophicRecord], thresholds: Sequence[float], catastrophic_name: str = CATASTROPHIC_CLASS_NAME
 ) -> list[dict[str, float | int]]:
     return [evaluate_catastrophic_threshold(records, t, catastrophic_name) for t in thresholds]
 
 
+# tuple[Optional[dict[str, float | int]], Optional[dict[str, float | int]]] find_lowest_threshold_for_precision(Sequence[dict[str, float | int]] sweep, float target_precision, float min_recall)
+# Inputs: Sequence[dict[str, float | int]] sweep - ascending-by-threshold sweep points (from
+#         sweep_catastrophic)
+#         float target_precision - minimum precision a threshold must reach
+#         float min_recall - minimum recall a threshold must also reach, to reject the vacuous
+#         precision=1.0-at-zero-predictions convention
+# Outputs: tuple[Optional[dict[str, float | int]], Optional[dict[str, float | int]]] - (result,
+#          vacuous_example): result is the first point meeting both target_precision and
+#          min_recall, or None; vacuous_example is set (only when result is None) to the first
+#          point that met target_precision but not min_recall
+# Description: Scans sweep ascending by threshold and returns the first point whose precision
+#              meets target_precision AND whose recall is at least min_recall. Mirrors
+#              training/evaluate.py's find_lowest_threshold_for_precision exactly (same
+#              two-return-value shape, same rationale): without the min_recall floor, a
+#              threshold so high the model almost never fires can "achieve" perfect precision
+#              purely by making almost no predictions -- a statistically meaningless,
+#              undeployable operating point.
+# Side Effects: None
 def find_lowest_threshold_for_precision(
     sweep: Sequence[dict[str, float | int]], target_precision: float, min_recall: float
 ) -> tuple[Optional[dict[str, float | int]], Optional[dict[str, float | int]]]:
-    """Scan `sweep` (ascending by threshold) and return the first point
-    whose precision meets `target_precision` AND whose recall is at least
-    `min_recall`, paired with the first point (if any) that met
-    `target_precision` alone but not `min_recall`.
-
-    Mirrors training/evaluate.py's `find_lowest_threshold_for_precision`
-    exactly (same two-return-value shape, same rationale): without the
-    `min_recall` floor, a threshold so high the model almost never fires
-    can "achieve" perfect precision purely by making almost no predictions
-    -- a statistically meaningless, undeployable operating point.
-
-    Returns `(result, vacuous_example)`:
-      - `result` is the first point meeting both conditions, or None.
-      - `vacuous_example` is set (only when `result` is None) to the first
-        point that met `target_precision` but NOT `min_recall`.
-    """
+    """Mirrors training/evaluate.py's function of the same name: without the min_recall
+    floor, a threshold so high the model never fires can "achieve" perfect precision vacuously."""
     vacuous_example: Optional[dict[str, float | int]] = None
     for pt in sweep:
         if pt["precision"] >= target_precision:
@@ -314,12 +293,16 @@ def find_lowest_threshold_for_precision(
     return None, vacuous_example
 
 
+# dict[str, float | int] best_supported_point(Sequence[dict[str, float | int]] sweep, float min_recall)
+# Inputs: Sequence[dict[str, float | int]] sweep - sweep points (from sweep_catastrophic)
+#         float min_recall - the recall floor a sweep point must clear to count as "supported"
+# Outputs: dict[str, float | int] - the chosen sweep point
+# Description: Picks the highest-precision sweep point that still clears min_recall (i.e.
+#              backed by real detections, not the vacuous 0-predictions artifact). Falls back
+#              to the single highest-recall point if the class never clears min_recall anywhere
+#              in the sweep. Mirrors training/evaluate.py's best_supported_point.
+# Side Effects: None
 def best_supported_point(sweep: Sequence[dict[str, float | int]], min_recall: float) -> dict[str, float | int]:
-    """Mirrors training/evaluate.py's `best_supported_point`: the
-    highest-precision sweep point that still clears `min_recall` (i.e.
-    backed by real detections, not the vacuous 0-predictions artifact).
-    Falls back to the single highest-recall point if the class never
-    clears `min_recall` anywhere in the sweep."""
     supported = [pt for pt in sweep if pt["recall"] >= min_recall]
     if supported:
         return max(supported, key=lambda pt: pt["precision"])
@@ -331,11 +314,17 @@ def best_supported_point(sweep: Sequence[dict[str, float | int]], min_recall: fl
 # --------------------------------------------------------------------------
 
 
+# dict[str, dict[str, object]] group_recall_by_source(Sequence[str] sources, Sequence[bool] correct)
+# Inputs: Sequence[str] sources - per-sample provenance label (e.g. "fdm", "argus_v2",
+#         "unknown"), same length as correct
+#         Sequence[bool] correct - whether the model's argmax matched the true class, per sample
+# Outputs: dict[str, dict[str, object]] - {source: {"support", "correct", "recall"}}; recall is
+#          None (not 0.0) for a source with zero support, so callers can't mistake "no data"
+#          for "zero recall"
+# Description: Groups correctness by source, used by the SOURCE-CONFOUND DIAGNOSTIC (analysis
+#              5) to compute spaghetti recall separately per dataset origin.
+# Side Effects: Raises ValueError if sources and correct differ in length. No I/O.
 def group_recall_by_source(sources: Sequence[str], correct: Sequence[bool]) -> dict[str, dict[str, object]]:
-    """Group `correct` (whether the model's argmax matched the true class)
-    by `sources`, returning `{source: {"support", "correct", "recall"}}`.
-    `recall` is `None` (not `0.0`) for a source with zero support, so
-    callers can't mistake "no data" for "zero recall"."""
     if len(sources) != len(correct):
         raise ValueError(f"sources and correct must be the same length, got {len(sources)} vs {len(correct)}")
     totals: dict[str, int] = defaultdict(int)
@@ -355,22 +344,24 @@ def group_recall_by_source(sources: Sequence[str], correct: Sequence[bool]) -> d
 
 
 # --------------------------------------------------------------------------
-# I/O -- dataset listing + model inference (not unit tested; exercised by
-# the real `--split test` run instead, same convention as
-# training/evaluate.py and training/build_classification_dataset.py's
-# network-touching functions).
+# I/O -- dataset listing + model inference (not unit tested; exercised via a real run).
 # --------------------------------------------------------------------------
 
 
+# list[tuple[Path, str]] list_split_images(Path data_dir, str split, Sequence[str] class_names)
+# Inputs: Path data_dir - classification dataset root (e.g. datasets/argus_cls)
+#         str split - split name, "train", "val", or "test"
+#         Sequence[str] class_names - class names to list images for, e.g. REPORT_CLASS_ORDER
+# Outputs: list[tuple[Path, str]] - (image_path, true_class_name) pairs, sorted by class then
+#          filename for determinism
+# Description: Lists every image directly inside data_dir/split/<class>/ for each of
+#              class_names. A missing class subdirectory is simply skipped (some classes may be
+#              evaluable: false in split_report.json and so have no test images at all) --
+#              callers should report which classes came back with zero images rather than
+#              silently proceeding as if that's expected.
+# Side Effects: Raises FileNotFoundError if data_dir/split doesn't exist. Read-only filesystem
+#               traversal otherwise.
 def list_split_images(data_dir: Path, split: str, class_names: Sequence[str]) -> list[tuple[Path, str]]:
-    """Return `(path, true_class_name)` for every image directly inside
-    `data_dir/split/<class>/` for each of `class_names`, sorted by class
-    then filename for determinism. A missing class subdirectory is simply
-    skipped (some classes may be `evaluable: false` in
-    datasets/argus_cls/split_report.json and so have no test images at
-    all) -- callers should report which classes came back with zero
-    images rather than silently proceeding as if that's expected.
-    """
     split_dir = data_dir / split
     if not split_dir.is_dir():
         raise FileNotFoundError(f"Split directory not found: {split_dir}")
@@ -385,15 +376,26 @@ def list_split_images(data_dir: Path, split: str, class_names: Sequence[str]) ->
     return records
 
 
+# tuple[np.ndarray, dict[int, str]] run_inference(Path weights, Sequence[Path] image_paths, int imgsz, int batch, str device)
+# Inputs: Path weights - path to the trained classification best.pt checkpoint
+#         Sequence[Path] image_paths - images to classify
+#         int imgsz - input image size the model expects
+#         int batch - inference batch size
+#         str device - CUDA device index, list, or "cpu"
+# Outputs: tuple[np.ndarray, dict[int, str]] - (probs, names): probs is a
+#          (len(image_paths), num_classes) float64 array (rows in the same order as
+#          image_paths); names is the model's own {index: class_name} mapping, the model's real
+#          output-index order that probs' columns are indexed by
+# Description: Runs the Ultralytics classifier over image_paths and returns per-image
+#              probability rows alongside the model's real class-name/index mapping, so callers
+#              never have to assume an index order themselves.
+# Side Effects: Imports ultralytics.YOLO lazily; loads the checkpoint into memory; runs a full
+#               GPU/CPU inference pass over every image (reads each image file from disk).
+#               Raises RuntimeError if model.predict returns a different number of results than
+#               inputs.
 def run_inference(
     weights: Path, image_paths: Sequence[Path], imgsz: int, batch: int, device: str
 ) -> tuple[np.ndarray, dict[int, str]]:
-    """Run the Ultralytics classifier over `image_paths` and return
-    `(probs, names)` where `probs` is a `(len(image_paths), num_classes)`
-    float array (rows in the SAME order as `image_paths`) and `names` is
-    the model's own `{index: class_name}` mapping -- the model's real
-    output-index order, which is what `probs`' columns are indexed by.
-    """
     from ultralytics import YOLO
 
     model = YOLO(str(weights))
@@ -418,13 +420,22 @@ def run_inference(
 # --------------------------------------------------------------------------
 
 
+# Optional[str] check_class_order_matches_model(Mapping[int, str] names_by_idx, Sequence[str] report_order)
+# Inputs: Mapping[int, str] names_by_idx - the model's own {index: class_name} mapping
+#         (model.names), its real output-index order
+#         Sequence[str] report_order - the human-readable order this report and
+#         config.example.yaml's commented-out class_names list use, e.g. REPORT_CLASS_ORDER
+# Outputs: Optional[str] - None if the orders match; otherwise a warning string describing the
+#          mismatch
+# Description: Compares the model's real output-index order (Ultralytics assigns indices
+#              alphabetically from training folder names) against report_order. Because
+#              ClassifierDetector (src/argus/detectors/classifier.py) trusts cfg.class_names to
+#              already be in the model's index order, a mismatch here means wiring up
+#              config.example.yaml's class_names list as literally written would silently
+#              mislabel every prediction -- this function is the check that catches that before
+#              deployment.
+# Side Effects: None
 def check_class_order_matches_model(names_by_idx: Mapping[int, str], report_order: Sequence[str]) -> Optional[str]:
-    """Compare the model's real output-index order against
-    `REPORT_CLASS_ORDER` (config.example.yaml's human-readable listing).
-    Returns `None` if they match; otherwise a warning string describing the
-    mismatch and why it matters for `ClassifierDetector`, which trusts
-    `cfg.class_names` to already be in the model's index order.
-    """
     model_order = [names_by_idx[i] for i in sorted(names_by_idx)]
     if list(report_order) == model_order:
         return None
@@ -442,6 +453,26 @@ def check_class_order_matches_model(names_by_idx: Mapping[int, str], report_orde
     )
 
 
+# dict[str, object] build_report(Sequence[str] y_true, np.ndarray probs, Mapping[int, str] names_by_idx, Sequence[str] sources, argparse.Namespace args)
+# Inputs: Sequence[str] y_true - true class name per test image
+#         np.ndarray probs - (num_images, num_classes) probability array from run_inference,
+#         columns indexed by names_by_idx
+#         Mapping[int, str] names_by_idx - the model's own {index: class_name} mapping
+#         Sequence[str] sources - per-image provenance label from infer_source, same length as
+#         y_true
+#         argparse.Namespace args - parsed CLI args (target_precision, min_recall, sweep
+#         bounds, weights, data, split)
+# Outputs: dict[str, object] - the full evaluation report: class-order warning, overall
+#          accuracy, per-class P/R/F1, the confusion matrix, the binary normal-vs-defect
+#          collapse, the p_failure catastrophic-path sweep, the source-confound diagnostic, and
+#          a human-readable interpretation
+# Description: Orchestrates all five analyses described in the module docstring (overall
+#              accuracy/per-class metrics, confusion matrix, binary normal-vs-defect collapse,
+#              the real runtime catastrophic-path threshold sweep for "spaghetti", and the
+#              source-confound diagnostic splitting spaghetti recall by dataset origin) into one
+#              JSON-serializable report, then appends a human-readable interpretation via
+#              build_interpretation.
+# Side Effects: None (pure computation over already-computed inference results; no I/O)
 def build_report(
     y_true: Sequence[str],
     probs: np.ndarray,
@@ -539,6 +570,21 @@ def build_report(
     return report
 
 
+# str _source_confound_conclusion(Optional[dict[str, object]] fdm_entry, Optional[dict[str, object]] argus_entry, Optional[float] recall_gap, int unknown_count)
+# Inputs: Optional[dict[str, object]] fdm_entry - group_recall_by_source's "fdm" entry, or None
+#         if no FDM-sourced spaghetti test images were found
+#         Optional[dict[str, object]] argus_entry - group_recall_by_source's "argus_v2" entry,
+#         or None if no argus_v2-sourced spaghetti test images were found
+#         Optional[float] recall_gap - |FDM recall - argus_v2 recall|, or None if undefined
+#         int unknown_count - number of spaghetti test images with unrecoverable provenance
+# Outputs: str - a human-readable verdict on whether the recall gap indicates the model is
+#          keying on dataset origin rather than the spaghetti defect itself (LARGE/MODERATE/
+#          SMALL gap, or inconclusive if either source has no data)
+# Description: Interprets the FDM-vs-argus_v2 spaghetti recall gap for the SOURCE-CONFOUND
+#              DIAGNOSTIC (analysis 5), classifying the gap size and explaining what it does and
+#              doesn't prove about the model's reliance on lighting/framing/compression cues
+#              versus the actual defect.
+# Side Effects: None (pure string formatting)
 def _source_confound_conclusion(
     fdm_entry: Optional[dict[str, object]],
     argus_entry: Optional[dict[str, object]],
@@ -584,6 +630,16 @@ def _source_confound_conclusion(
     return verdict + unknown_note
 
 
+# str build_interpretation(dict[str, object] report)
+# Inputs: dict[str, object] report - the in-progress report dict from build_report (must
+#         already have "p_failure_catastrophic" and "source_confound" populated)
+# Outputs: str - a multi-line human-readable verdict: whether the model is fit to drive
+#          automated print-pausing on the spaghetti path, a precision summary, a source-confound
+#          summary, and (if present) the class-order warning
+# Description: Synthesizes the catastrophic-path precision result and the source-confound
+#              recall gap into one bottom-line recommendation on whether this model should be
+#              allowed to drive automated pause/cancel actions, or should stay notify_only.
+# Side Effects: None (pure string formatting)
 def build_interpretation(report: dict[str, object]) -> str:
     cat = report["p_failure_catastrophic"]  # type: ignore[assignment]
     confound = report["source_confound"]  # type: ignore[assignment]
@@ -659,6 +715,14 @@ def build_interpretation(report: dict[str, object]) -> str:
 # --------------------------------------------------------------------------
 
 
+# None print_report(dict[str, object] report)
+# Inputs: dict[str, object] report - the full evaluation report from build_report
+# Outputs: None
+# Description: Prints the human-readable evaluation report to stdout: overall accuracy and
+#              per-class table, the confusion matrix, the binary normal-vs-defect breakdown and
+#              false-positive rate, the p_failure catastrophic-path threshold sweep, the
+#              source-confound diagnostic, and the final interpretation.
+# Side Effects: Prints the full evaluation report to stdout. No filesystem writes.
 def print_report(report: dict[str, object]) -> None:
     print()
     print("=" * 88)
@@ -774,6 +838,15 @@ def print_report(report: dict[str, object]) -> None:
 # --------------------------------------------------------------------------
 
 
+# argparse.Namespace parse_args(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: argparse.Namespace - parsed evaluation options (weights, data, split, imgsz, batch,
+#          device, target_precision, min_recall, sweep_start/end/step, out). Notable defaults:
+#          --split test, --target-precision 0.95, --min-recall 0.05 (the vacuous-precision
+#          floor, same rationale as training/evaluate.py).
+# Description: Defines and parses the CLI for evaluating the classification checkpoint.
+# Side Effects: None (argparse may print usage/help and call sys.exit on bad input, but no
+#               filesystem or network activity)
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS, help=f"Path to trained best.pt (default: {DEFAULT_WEIGHTS})")
@@ -802,6 +875,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# None main(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: None
+# Description: CLI entry point. Lists the requested split's images, warns about classes with
+#              zero images, recovers each image's source provenance, runs inference, builds the
+#              full evaluation report, prints it, and writes it to disk as JSON.
+# Side Effects: Raises FileNotFoundError if --weights or --data don't exist; raises
+#               RuntimeError if the split has no images at all; runs a full GPU/CPU inference
+#               pass reading every listed image from disk (see run_inference); prints progress,
+#               warnings, and the full evaluation report to stdout; creates --out's parent
+#               directory and writes the full JSON report to --out (default
+#               runs/classifier_evaluation.json).
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 

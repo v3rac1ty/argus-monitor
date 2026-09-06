@@ -1,22 +1,6 @@
-"""Export a trained YOLO checkpoint (best.pt) to ONNX and verify the
-resulting model has an output layout the runtime detector can actually
-parse.
+"""Exports a trained YOLO checkpoint (best.pt) to ONNX and verifies the output layout is one the runtime detector can parse: legacy YOLOv8 raw predictions ``(1, 4+num_classes, N)`` (or its transpose) or YOLO26's end-to-end/NMS-free ``(1, N, 6)`` rows. Reuses the runtime's own ``detect_layout()`` (src/argus/detectors/onnx_yolo.py) rather than re-deriving the shape rule, so verification can't drift out of sync with the runtime.
 
-src/argus/detectors/onnx_yolo.py supports two output contracts -- legacy
-YOLOv8 (raw, NMS-pending predictions shaped `(1, 4 + num_classes,
-num_anchors)` or its transpose) and YOLO26's end-to-end/NMS-free layout
-(`(1, max_det, 6)`, each row already decoded as `[x1, y1, x2, y2, confidence,
-class_id]`) -- and exposes `detect_layout()` to tell them apart from a raw
-output tensor. This script reuses that *exact* helper (rather than
-re-deriving the shape rule here) so verification can never silently drift out
-of sync with what the runtime does: it runs a real onnxruntime session
-against the freshly exported model with a random input, feeds the raw output
-through the same `detect_layout()` the runtime calls, and fails loudly if
-neither contract matches.
-
-Usage:
-    python training/export_onnx.py --weights runs/train/argus_yolov8n/weights/best.pt
-    python training/export_onnx.py --weights runs/train/yolo26s_v1/weights/best.pt --imgsz 512
+Usage: python training/export_onnx.py --weights runs/train/argus_yolov8n/weights/best.pt [--imgsz 640]
 """
 
 from __future__ import annotations
@@ -39,6 +23,14 @@ DEFAULT_OUT_PATH = DEFAULT_MODELS_DIR / "argus.onnx"
 DEFAULT_NUM_CLASSES = 5  # error extrusion, spaghetti, stringing, warping, zits
 
 
+# argparse.Namespace parse_args(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: argparse.Namespace - parsed --weights, --imgsz (default 640), --opset (default 12),
+#          --out (default models/argus.onnx), --no-simplify, and --nc (default None, resolved
+#          later by resolve_num_classes)
+# Description: Defines and parses the CLI for exporting a trained checkpoint to ONNX.
+# Side Effects: None (argparse may print usage/help and call sys.exit on bad input, but no
+#               filesystem or network activity)
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--weights", type=Path, required=True, help="Path to trained best.pt")
@@ -59,15 +51,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# tuple[Path, Optional[dict[int, str]]] export_to_onnx(Path weights, int imgsz, int opset, bool simplify)
+# Inputs: Path weights - path to the trained best.pt checkpoint
+#         int imgsz - export image size, must match the imgsz used for training
+#         int opset - ONNX opset version to export with
+#         bool simplify - whether to run onnx-simplifier on the exported graph
+# Outputs: tuple[Path, Optional[dict[int, str]]] - path Ultralytics wrote the ONNX file to, and
+#          the {class_id: class_name} mapping baked into the checkpoint (model.names), or None
+#          if the loaded model has no such attribute
+# Description: Runs the Ultralytics ONNX export for the given checkpoint and returns both the
+#              output path and the model's class-name mapping so the caller can derive
+#              num_classes from the actual model rather than a hardcoded constant.
+# Side Effects: Imports ultralytics.YOLO lazily; loads the checkpoint into memory; writes an
+#               .onnx file to disk (path chosen by Ultralytics, alongside the weights file).
 def export_to_onnx(weights: Path, imgsz: int, opset: int, simplify: bool) -> tuple[Path, Optional[dict[int, str]]]:
-    """Run the Ultralytics ONNX export and return `(exported_path, names)`.
-
-    `names` is the `{class_id: class_name}` mapping baked into the checkpoint
-    -- Ultralytics exposes this as `model.names` on any loaded `YOLO` model,
-    YOLOv8 or YOLO26 alike -- or `None` if the loaded model has no such
-    attribute. Returning it lets the caller derive `num_classes` from the
-    actual model being exported instead of assuming a hardcoded constant.
-    """
     from ultralytics import YOLO
 
     model = YOLO(str(weights))
@@ -76,11 +73,17 @@ def export_to_onnx(weights: Path, imgsz: int, opset: int, simplify: bool) -> tup
     return Path(exported_path), names
 
 
+# tuple[int, str] resolve_num_classes(Optional[int] cli_nc, Optional[dict[int, str]] model_names)
+# Inputs: Optional[int] cli_nc - explicit --nc value from the CLI, or None
+#         Optional[dict[int, str]] model_names - the exported model's {class_id: class_name}
+#         mapping, or None if unavailable
+# Outputs: tuple[int, str] - (num_classes, source) where source describes where the value came
+#          from (--nc, the model's own names, or the hardcoded DEFAULT_NUM_CLASSES) for the
+#          printed summary
+# Description: Picks num_classes for verification, preferring an explicit --nc, then the
+#              exported model's own names, and only then the hardcoded default.
+# Side Effects: None
 def resolve_num_classes(cli_nc: Optional[int], model_names: Optional[dict[int, str]]) -> tuple[int, str]:
-    """Pick `num_classes` for verification, preferring (in order): an
-    explicit `--nc`, the exported model's own `names`, and only then the
-    hardcoded default. Returns `(num_classes, source)` where `source`
-    describes where the value came from, for the printed summary."""
     if cli_nc is not None:
         return cli_nc, f"--nc={cli_nc}"
     if model_names:
@@ -89,14 +92,19 @@ def resolve_num_classes(cli_nc: Optional[int], model_names: Optional[dict[int, s
     return DEFAULT_NUM_CLASSES, f"default ({DEFAULT_NUM_CLASSES}; could not read class names off the exported model)"
 
 
+# tuple[tuple[int, ...], str] classify_output_shape(np.ndarray raw, int num_classes)
+# Inputs: np.ndarray raw - raw ONNX model output array from an inference run
+#         int num_classes - number of classes the model was trained with
+# Outputs: tuple[tuple[int, ...], str] - (shape, layout) where layout is "yolov8" or the
+#          YOLO26 end-to-end layout name, exactly as src/argus/detectors/onnx_yolo.py's
+#          detect_layout() would resolve it for this array
+# Description: Classifies a raw ONNX output array's layout by delegating to the runtime
+#              detector's own detect_layout() (not a reimplementation), so export-time
+#              verification can never silently drift out of sync with what the runtime does.
+#              Pure/no I/O, so it's testable with synthetic arrays.
+# Side Effects: Raises AssertionError (wrapping detect_layout's ValueError) if raw matches
+#               neither the YOLOv8 layout nor the YOLO26 end-to-end layout. No I/O.
 def classify_output_shape(raw: np.ndarray, num_classes: int) -> tuple[tuple[int, ...], str]:
-    """Given a raw ONNX output array, return `(shape, layout)` where `layout`
-    is exactly what `OnnxYoloDetector` (src/argus/detectors/onnx_yolo.py)
-    would resolve to for this same array and `num_classes` -- it's computed
-    by that module's own `detect_layout()`, not a reimplementation of the
-    rule. Raises `AssertionError` (wrapping `detect_layout`'s `ValueError`)
-    if `raw` matches neither the YOLOv8 layout nor the YOLO26 end-to-end
-    layout. Pure/no I/O, so it's testable with synthetic arrays."""
     shape = tuple(raw.shape)
     try:
         layout = detect_layout(raw, num_classes)
@@ -110,11 +118,19 @@ def classify_output_shape(raw: np.ndarray, num_classes: int) -> tuple[tuple[int,
     return shape, layout
 
 
+# tuple[tuple[int, ...], str] verify_onnx(Path onnx_path, int imgsz, int num_classes)
+# Inputs: Path onnx_path - path to the exported ONNX model file
+#         int imgsz - input image size the model expects (square input)
+#         int num_classes - number of classes the model was trained with
+# Outputs: tuple[tuple[int, ...], str] - (shape, layout) of the raw output, via
+#          classify_output_shape
+# Description: Loads onnx_path with onnxruntime (CPU provider), runs one deterministic random
+#              input through it, and classifies the resulting output layout.
+# Side Effects: Loads the ONNX file into an onnxruntime InferenceSession (CPU); runs one
+#               forward pass. RNG is a locally-created np.random.default_rng(seed=1337), so it
+#               does not touch global RNG state. Raises AssertionError if the output doesn't
+#               match a layout the runtime detector can parse.
 def verify_onnx(onnx_path: Path, imgsz: int, num_classes: int) -> tuple[tuple[int, ...], str]:
-    """Load `onnx_path` with onnxruntime, run one random input through it,
-    and return `(shape, layout)` via `classify_output_shape`. Raises
-    `AssertionError` if the output doesn't match a layout the runtime
-    detector can parse."""
     import onnxruntime as ort
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
@@ -130,6 +146,17 @@ def verify_onnx(onnx_path: Path, imgsz: int, num_classes: int) -> tuple[tuple[in
     return classify_output_shape(raw, num_classes)
 
 
+# None main(list[str] | None argv)
+# Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
+# Outputs: None
+# Description: CLI entry point. Exports the given checkpoint to ONNX, resolves num_classes,
+#              copies the exported file to the final --out destination, verifies the output
+#              layout with onnxruntime, and prints a verification summary including which
+#              detector.layout setting to use if not left on "auto".
+# Side Effects: Raises FileNotFoundError if --weights doesn't exist; writes an ONNX file to
+#               disk via Ultralytics export; creates --out's parent directory and copies the
+#               exported file there (shutil.copy2); runs a verification inference pass via
+#               onnxruntime; prints export progress and a verification report to stdout.
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 

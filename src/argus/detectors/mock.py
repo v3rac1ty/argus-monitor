@@ -31,6 +31,18 @@ class MockDetector(Detector):
     `cycle=True` wraps back around to the start of the script.
     """
 
+    # None __init__(Sequence[float] script, bool cycle, float inference_ms)
+    # Inputs: Sequence[float] script - ordered p_failure values to play back, one per `infer`
+    #                 call; must be non-empty
+    #         bool cycle - default False. If False, once `script` is exhausted the last value is
+    #                 repeated forever; if True, playback wraps back to the start of `script`
+    #         float inference_ms - default 0.0. Fixed `inference_ms` value stamped onto every
+    #                 returned `DetectionResult`
+    # Outputs: None
+    # Description: Constructs a `MockDetector` that will replay `script` deterministically
+    #              across successive `infer` calls, per the class docstring's `cycle` semantics.
+    # Side Effects: Mutates the new instance's state (`_script`, `_cycle`, `_inference_ms`,
+    #               `_call_count`); raises `ValueError` if `script` is empty.
     def __init__(
         self,
         script: Sequence[float],
@@ -44,11 +56,27 @@ class MockDetector(Detector):
         self._inference_ms = inference_ms
         self._call_count = 0
 
+    # int call_count()
+    # Inputs: None
+    # Outputs: int - number of times `infer` has been called so far
+    # Description: Read-only accessor exposing the detector's internal call counter, primarily
+    #              useful for tests asserting how many frames were processed.
+    # Side Effects: None
     @property
     def call_count(self) -> int:
-        """Number of times `infer` has been called so far."""
         return self._call_count
 
+    # DetectionResult infer(Frame frame)
+    # Inputs: Frame frame - the captured camera frame (its contents are ignored -- this
+    #                 detector is scripted, not model-driven)
+    # Outputs: DetectionResult - an empty result if the scripted value for this call is <= 0,
+    #          otherwise a result containing a single synthetic CATASTROPHIC `spaghetti`
+    #          `Detection` whose confidence is that scripted value
+    # Description: Consumes the next scripted `p_failure` value (per `cycle`'s wraparound vs.
+    #              clamp-at-end rule) and turns it into a `DetectionResult`, letting tests drive
+    #              the decision engine/service loop deterministically without a real model.
+    # Side Effects: Advances (increments) the instance's `_call_count`, consuming one entry
+    #               from the script.
     def infer(self, frame: Frame) -> DetectionResult:
         index = self._call_count
         if self._cycle:

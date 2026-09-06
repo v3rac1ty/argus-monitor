@@ -1,32 +1,11 @@
 """ONNX detector supporting both YOLOv8 and YOLO26 output contracts.
 
-All tensor pre/post-processing lives in module-level *pure functions* that
-operate on plain numpy arrays (`letterbox`, `preprocess`, `postprocess`,
-`postprocess_end2end`, `detect_layout`, and the private NMS helpers). This
-keeps them fully unit-testable with synthetic arrays and no model file on
-disk. `OnnxYoloDetector` is a thin wrapper that owns the
-`onnxruntime.InferenceSession` and glues those pure functions to the
-`Detector` interface; the session is only constructed in `__init__`, and
-only when a real model path is given.
-
-Two output contracts are supported, selected via `DetectorConfig.layout`:
-
-- **YOLOv8** (`"yolov8"`): raw predictions shaped `(1, 4 + num_classes,
-  num_anchors)` -- transposed relative to YOLOv5, and with no separate
-  objectness channel: the per-class scores at columns 4.. are already the
-  final confidences. `postprocess` handles both this layout and its
-  transpose, then applies per-class thresholds and class-aware NMS.
-- **YOLO26** (`"end2end"`): the model is NMS-free / end-to-end and its ONNX
-  export already does the decoding -- output is `(1, max_det, 6)`, each row
-  `[x1, y1, x2, y2, confidence, class_id]` in letterboxed input-pixel space,
-  sorted by descending confidence and padded with zero/low-confidence rows.
-  `postprocess_end2end` handles this: no transpose, no argmax, and
-  critically **no NMS** (the model already did it -- redoing it here would
-  silently drop valid adjacent detections).
-
-`"auto"` (the default) picks between them via `detect_layout` -- see that
-function's docstring for the shape heuristic and its one documented
-ambiguity (exactly 2 classes).
+`DetectorConfig.layout` selects the contract ("auto" picks via
+`detect_layout`): `postprocess` (YOLOv8) applies class-aware NMS to raw,
+NMS-pending predictions; `postprocess_end2end` (YOLO26) applies **no NMS**
+since that model is already NMS-free/end-to-end -- redoing it would silently
+drop valid adjacent detections. All pre/post-processing is pure functions on
+plain numpy arrays, unit-testable with no model file on disk.
 """
 
 from __future__ import annotations
@@ -64,18 +43,26 @@ _LETTERBOX_COLOR: tuple[int, int, int] = (114, 114, 114)
 # --------------------------------------------------------------------------
 
 
+# tuple[np.ndarray, float, tuple[float, float]] letterbox(np.ndarray image, Union[int, tuple[int, int]] new_shape, tuple[int, int, int] color)
+# Inputs: np.ndarray image - source BGR frame (HxWx3, uint8) to letterbox
+#         Union[int, tuple[int, int]] new_shape - target size; an int means a square
+#                 new_shape x new_shape, else (target_h, target_w)
+#         tuple[int, int, int] color - default `_LETTERBOX_COLOR` (114, 114, 114). BGR fill
+#                 color for the padding
+# Outputs: tuple[np.ndarray, float, tuple[float, float]] - (padded_image, scale, (pad_w,
+#          pad_h)): `scale` is the resize factor applied to the original image, and
+#          `(pad_w, pad_h)` is the (possibly fractional) left/top padding added -- together
+#          exactly what's needed to invert the transform via
+#          `orig = (letterboxed - pad) / scale`
+# Description: Resizes `image` preserving aspect ratio to fit within `new_shape`, then pads
+#              with `color` to reach `new_shape` exactly, splitting the (possibly odd) total
+#              padding across both sides the same way Ultralytics' own letterbox does.
+# Side Effects: None (pure function of its inputs).
 def letterbox(
     image: np.ndarray,
     new_shape: Union[int, tuple[int, int]],
     color: tuple[int, int, int] = _LETTERBOX_COLOR,
 ) -> tuple[np.ndarray, float, tuple[float, float]]:
-    """Resize `image` preserving aspect ratio and pad to `new_shape` with grey.
-
-    Returns `(padded_image, scale, (pad_w, pad_h))` where `scale` is the
-    factor the original image was resized by and `(pad_w, pad_h)` is the
-    (possibly fractional) left/top padding added -- exactly what's needed to
-    invert the transform: `orig = (letterboxed - pad) / scale`.
-    """
     if isinstance(new_shape, int):
         target_h, target_w = new_shape, new_shape
     else:
@@ -105,13 +92,17 @@ def letterbox(
     return padded, scale, (dw, dh)
 
 
+# tuple[np.ndarray, float, tuple[float, float]] preprocess(np.ndarray image, int input_size)
+# Inputs: np.ndarray image - source BGR frame (HxWx3, uint8) to preprocess
+#         int input_size - target square model input size
+# Outputs: tuple[np.ndarray, float, tuple[float, float]] - (blob, scale, pad): `blob` is a
+#          (1, 3, H, W) float32 array in [0, 1], RGB, channel-first; `scale`/`pad` are passed
+#          through unchanged from `letterbox` for later use by `postprocess`/
+#          `postprocess_end2end`
+# Description: Letterboxes `image` to a square `input_size` via `letterbox`, then converts
+#              BGR->RGB, HWC->CHW, and scales to [0, 1] to build the model-ready blob.
+# Side Effects: None (pure function of its inputs).
 def preprocess(image: np.ndarray, input_size: int) -> tuple[np.ndarray, float, tuple[float, float]]:
-    """Letterbox `image` to a square `input_size` and build a model-ready blob.
-
-    Returns `(blob, scale, pad)` where `blob` is `(1, 3, H, W)` float32 in
-    [0, 1], RGB, channel-first -- and `scale`/`pad` are passed through
-    unchanged from `letterbox` for later use by `postprocess`.
-    """
     padded, scale, pad = letterbox(image, input_size)
     rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
     chw = rgb.transpose(2, 0, 1)
@@ -120,10 +111,18 @@ def preprocess(image: np.ndarray, input_size: int) -> tuple[np.ndarray, float, t
     return blob, scale, pad
 
 
+# np.ndarray _to_rows(np.ndarray raw, int expected_cols)
+# Inputs: np.ndarray raw - raw YOLOv8 ONNX output, either `(1, 4+nc, N)`, `(1, N, 4+nc)`, or
+#                 either of those without the batch dimension
+#         int expected_cols - `4 + num_classes`, used to identify which axis is the
+#                 per-anchor feature axis
+# Outputs: np.ndarray - a 2D `(num_anchors, 4 + num_classes)` array
+# Description: Normalizes a raw YOLOv8 output into the canonical 2D row-per-anchor layout,
+#              handling both the native transposed-relative-to-YOLOv5 layout and an
+#              already-transposed one. Raises `ValueError` if the shape doesn't match
+#              `expected_cols` on either axis, or has an unexpected batch size/dimensionality.
+# Side Effects: None (pure function of its inputs).
 def _to_rows(raw: np.ndarray, expected_cols: int) -> np.ndarray:
-    """Normalize a raw YOLOv8 output to a 2D `(num_anchors, 4 + num_classes)`
-    array, handling both the native `(1, 4+nc, N)` layout and an
-    already-transposed `(1, N, 4+nc)` one (or either without the batch dim)."""
     arr = np.asarray(raw)
 
     if arr.ndim == 3:
@@ -142,6 +141,32 @@ def _to_rows(raw: np.ndarray, expected_cols: int) -> np.ndarray:
     )
 
 
+# tuple[Detection, ...] postprocess(np.ndarray raw, float scale, tuple[float, float] pad, tuple[int, int] orig_shape, Sequence[str] class_names, Mapping[str, float] class_thresholds, float default_threshold, Mapping[str, Severity] severity_map, float nms_iou)
+# Inputs: np.ndarray raw - raw YOLOv8 ONNX output tensor
+#         float scale - letterbox scale factor from `preprocess`/`letterbox`
+#         tuple[float, float] pad - (pad_w, pad_h) letterbox padding in pixels
+#         tuple[int, int] orig_shape - (height, width) of the original frame, used to clip
+#                 boxes back into bounds
+#         Sequence[str] class_names - ordered class names matching the model's output columns
+#         Mapping[str, float] class_thresholds - per-class-name confidence threshold overrides
+#         float default_threshold - threshold used for any class name absent from
+#                 `class_thresholds`
+#         Mapping[str, Severity] severity_map - per-class-name Severity; a name absent from it
+#                 defaults to Severity.COSMETIC so an unrecognized class can never drive the
+#                 stop decision
+#         float nms_iou - IoU threshold above which two same-class boxes are considered
+#                 duplicates during NMS
+# Outputs: tuple[Detection, ...] - final detections in ORIGINAL frame coordinates, after
+#          per-class thresholding and class-aware NMS
+# Description: Turns a raw YOLOv8 ONNX output into final `Detection`s: normalizes the tensor
+#              via `_to_rows`, takes the argmax class per anchor, applies per-class confidence
+#              thresholds, inverts the letterbox transform back to original-frame pixel
+#              coordinates and clips to frame bounds, then runs class-aware NMS (`_class_aware_
+#              nms`) so different classes never suppress each other. Unlike
+#              `postprocess_end2end` (the YOLO26 path), this path DOES apply NMS -- the raw
+#              YOLOv8 predictions are NMS-pending, whereas YOLO26's end-to-end output already
+#              had NMS applied internally and must not be NMS'd again.
+# Side Effects: None (pure function of its inputs).
 def postprocess(
     raw: np.ndarray,
     scale: float,
@@ -153,15 +178,6 @@ def postprocess(
     severity_map: Mapping[str, Severity],
     nms_iou: float,
 ) -> tuple[Detection, ...]:
-    """Turn a raw YOLOv8 ONNX output tensor into final `Detection`s.
-
-    `scale`/`pad` (from `preprocess`/`letterbox`) invert the letterbox back
-    to original-frame pixel coordinates. Per-class thresholds gate which
-    boxes survive at all; class-aware NMS (different classes never suppress
-    each other) then dedupes overlapping boxes of the same class. A class
-    name absent from `severity_map` defaults to `Severity.COSMETIC` so an
-    unrecognized class can never drive the stop decision.
-    """
     num_classes = len(class_names)
     rows = _to_rows(raw, 4 + num_classes)
 
@@ -231,24 +247,23 @@ def postprocess(
     return tuple(detections)
 
 
+# str detect_layout(np.ndarray raw, int num_classes)
+# Inputs: np.ndarray raw - a raw (or zero-filled probe) model output tensor whose shape is
+#                 used to infer the layout
+#         int num_classes - number of trained classes, used to compute `4 + num_classes`
+# Outputs: str - `"yolov8"` or `"end2end"`
+# Description: Infers which ONNX output contract `raw` follows by shape heuristic: squeezes
+#              the batch dim, then returns `"yolov8"` if any remaining axis equals
+#              `4 + num_classes`, else `"end2end"` if the last axis is exactly 6, else raises
+#              `ValueError`. When `num_classes == 2`, `4 + num_classes == 6` is ambiguous; the
+#              `"yolov8"` check runs first so this case always resolves to `"yolov8"` (see the
+#              function's own docstring for the documented workaround).
+# Side Effects: None (pure function of its inputs).
 def detect_layout(raw: np.ndarray, num_classes: int) -> str:
-    """Infer which ONNX output contract `raw` follows: `"yolov8"` (raw,
-    NMS-pending predictions) or `"end2end"` (YOLO26's decoded, NMS-free
-    output).
-
-    Heuristic: squeeze the batch dim, then
-
-    1. if any remaining axis equals `4 + num_classes` -> `"yolov8"`
-    2. elif the last axis is exactly `6` -> `"end2end"`
-    3. else raise `ValueError` naming the actual shape and `num_classes`.
-
-    **Ambiguity:** when `num_classes == 2`, `4 + num_classes == 6`, so a
-    `(*, 6)`-shaped output could legitimately be either layout and shape
-    alone cannot disambiguate it. Check (1) runs first, so this case always
-    resolves to `"yolov8"`. If you train a 2-class model and actually mean
-    the end-to-end layout, do not rely on `"auto"` -- set `detector.layout`
-    to `"end2end"` explicitly in config.
-    """
+    """When num_classes == 2, 4+num_classes == 6 is ambiguous with the
+    end2end row width; the yolov8 check runs first so this always resolves
+    to "yolov8" -- a 2-class end2end model must set detector.layout
+    explicitly rather than "auto"."""
     arr = np.asarray(raw)
     if arr.ndim == 3:
         if arr.shape[0] != 1:
@@ -269,16 +284,19 @@ def detect_layout(raw: np.ndarray, num_classes: int) -> str:
     )
 
 
+# tuple[int, ...] _probe_layout_shape(Optional[Sequence[object]] declared_shape)
+# Inputs: Optional[Sequence[object]] declared_shape - the ONNX-declared output shape (e.g.
+#                 from `session.get_outputs()[0].shape`), whose batch/anchor dims may be
+#                 dynamic and show up as strings, None, or negative sentinels
+# Outputs: tuple[int, ...] - a concrete shape usable to build a zero-filled probe array for
+#          `detect_layout`; `()` if `declared_shape` is falsy
+# Description: Converts a possibly-symbolic ONNX-declared shape into a concrete one: replaces
+#              any non-batch dynamic dim with 0 (which can never coincidentally match
+#              `4 + num_classes` or 6 for a real model, so it never causes a false layout
+#              match) and forces the batch dim (axis 0) to 1, since every real inference call
+#              here uses a batch of exactly 1.
+# Side Effects: None (pure function of its input).
 def _probe_layout_shape(declared_shape: Optional[Sequence[object]]) -> tuple[int, ...]:
-    """Turn an ONNX-declared output shape (whose batch/anchor dims may be
-    dynamic and show up as strings, `None`, or negative sentinels) into a
-    concrete shape usable to build a zero-filled probe array for
-    `detect_layout`. Non-batch dynamic dims are replaced with `0`, which can
-    never coincidentally equal `4 + num_classes` or `6` for a real model, so
-    they never cause a false match. The batch dim (axis 0) is always forced
-    to `1` regardless of what's declared, since every real inference call
-    here uses a batch of exactly 1 -- leaving a dynamic batch dim as `0`
-    would make `detect_layout` reject the probe outright."""
     if not declared_shape:
         return ()
     dims = [d if isinstance(d, int) and d > 0 else 0 for d in declared_shape]
@@ -289,12 +307,21 @@ def _probe_layout_shape(declared_shape: Optional[Sequence[object]]) -> tuple[int
 _VALID_LAYOUTS = {"yolov8", "end2end"}
 
 
+# str _resolve_layout(str configured, Optional[Sequence[object]] declared_output_shape, int num_classes)
+# Inputs: str configured - `DetectorConfig.layout` value: `"auto"`, `"yolov8"`, or `"end2end"`
+#         Optional[Sequence[object]] declared_output_shape - the model's declared ONNX output
+#                 shape (from `session.get_outputs()[0].shape`), used only when `configured`
+#                 is `"auto"`
+#         int num_classes - number of trained classes, forwarded to `detect_layout`
+# Outputs: str - the concrete layout to use for every inference call: `"yolov8"` or `"end2end"`
+# Description: Resolves the layout once (meant to be called a single time at detector
+#              construction and reused for every `infer()` call, never re-detected per-frame):
+#              returns `configured` verbatim if it's explicit, otherwise runs `detect_layout`'s
+#              heuristic against a zero-filled probe array built from `declared_output_shape`
+#              via `_probe_layout_shape`. Raises `ValueError` if `configured` is neither
+#              `"auto"` nor a valid layout name.
+# Side Effects: None (pure function of its inputs).
 def _resolve_layout(configured: str, declared_output_shape: Optional[Sequence[object]], num_classes: int) -> str:
-    """Resolve the concrete layout ("yolov8" or "end2end") to use for every
-    inference: the configured value verbatim if it's explicit, otherwise
-    `detect_layout`'s heuristic run once against the model's declared ONNX
-    output shape (`declared_output_shape`, from
-    `session.get_outputs()[0].shape`)."""
     if configured != "auto":
         if configured not in _VALID_LAYOUTS:
             raise ValueError(f"detector.layout must be one of {sorted(_VALID_LAYOUTS)}, got {configured!r}")
@@ -303,6 +330,33 @@ def _resolve_layout(configured: str, declared_output_shape: Optional[Sequence[ob
     return detect_layout(probe, num_classes)
 
 
+# tuple[Detection, ...] postprocess_end2end(np.ndarray raw, float scale, tuple[float, float] pad, tuple[int, int] orig_shape, Sequence[str] class_names, Mapping[str, float] class_thresholds, float default_threshold, Mapping[str, Severity] severity_map)
+# Inputs: np.ndarray raw - raw YOLO26 end-to-end ONNX output, `(1, max_det, 6)` or
+#                 `(max_det, 6)`, each row already decoded as [x1, y1, x2, y2, confidence,
+#                 class_id] in letterboxed input-pixel space
+#         float scale - letterbox scale factor from `preprocess`/`letterbox`
+#         tuple[float, float] pad - (pad_w, pad_h) letterbox padding in pixels
+#         tuple[int, int] orig_shape - (height, width) of the original frame, used to clip
+#                 boxes back into bounds
+#         Sequence[str] class_names - ordered class names matching the model's class ids
+#         Mapping[str, float] class_thresholds - per-class-name confidence threshold overrides
+#         float default_threshold - threshold used for any class name absent from
+#                 `class_thresholds`
+#         Mapping[str, Severity] severity_map - per-class-name Severity; a name absent from it
+#                 defaults to Severity.COSMETIC so an unrecognized class can never drive the
+#                 stop decision
+# Outputs: tuple[Detection, ...] - detections above their per-class thresholds, in ORIGINAL
+#          frame coordinates
+# Description: Decodes YOLO26's already-decoded end-to-end output: drops padded rows
+#              (confidence <= 0, or a class id outside `range(len(class_names))`, since a
+#              padded row can carry a garbage class index), applies per-class confidence
+#              thresholds, then inverts the letterbox transform back to original-frame pixel
+#              coordinates and clips to frame bounds (decoded boxes can fall slightly outside
+#              [0, input_size]). Deliberately applies **no NMS** -- unlike `postprocess`'s
+#              YOLOv8 path, the model here is NMS-free/end-to-end and already deduplicated its
+#              own output, so two heavily-overlapping same-class boxes are both genuine and
+#              both kept; redoing NMS here would silently drop valid adjacent detections.
+# Side Effects: None (pure function of its inputs).
 def postprocess_end2end(
     raw: np.ndarray,
     scale: float,
@@ -313,27 +367,10 @@ def postprocess_end2end(
     default_threshold: float,
     severity_map: Mapping[str, Severity],
 ) -> tuple[Detection, ...]:
-    """Turn a raw YOLO26 end-to-end ONNX output tensor into final
-    `Detection`s.
-
-    Expects `(1, max_det, 6)` (or `(max_det, 6)`), each row already decoded
-    as `[x1, y1, x2, y2, confidence, class_id]` in letterboxed input-pixel
-    space -- no transpose, no argmax needed. Padded rows (confidence <= 0,
-    or a class id outside `range(len(class_names))` -- a padded row can
-    carry a garbage class index) are dropped first. Per-class thresholds
-    then gate which of the remaining boxes survive, exactly as in
-    `postprocess`. `scale`/`pad` invert the letterbox back to
-    original-frame pixel coordinates, and coordinates are clipped to the
-    original frame bounds since decoded boxes can fall slightly outside
-    `[0, input_size]`.
-
-    Deliberately does **no NMS**: the model is NMS-free/end-to-end and
-    already deduplicated its own output, so two heavily-overlapping
-    same-class boxes here are both genuine and both kept -- unlike
-    `postprocess`'s YOLOv8 path.  A class name absent from `severity_map`
-    defaults to `Severity.COSMETIC` so an unrecognized class can never drive
-    the stop decision.
-    """
+    """Deliberately applies no NMS: the model is NMS-free/end-to-end and
+    already deduplicated its own output, so overlapping same-class boxes
+    here are both genuine and both kept -- unlike `postprocess`'s YOLOv8
+    path."""
     arr = np.asarray(raw)
     if arr.ndim == 3:
         if arr.shape[0] != 1:
@@ -402,14 +439,24 @@ def postprocess_end2end(
     return tuple(detections)
 
 
+# list[int] _class_aware_nms(np.ndarray boxes, np.ndarray scores, np.ndarray class_ids, float iou_threshold)
+# Inputs: np.ndarray boxes - (N, 4) xyxy boxes
+#         np.ndarray scores - (N,) confidence scores, one per box
+#         np.ndarray class_ids - (N,) integer class id per box
+#         float iou_threshold - IoU above which two same-class boxes are considered duplicates
+# Outputs: list[int] - indices into `boxes`/`scores` to keep, sorted by descending score
+# Description: Runs `_nms` independently within each distinct class id (so boxes of different
+#              classes never suppress each other), then merges and re-sorts the per-class
+#              survivors by descending score. This is the NMS step used by `postprocess` (the
+#              YOLOv8 path) only -- `postprocess_end2end` (YOLO26) never calls this, since that
+#              model's output is already NMS'd.
+# Side Effects: None (pure function of its inputs).
 def _class_aware_nms(
     boxes: np.ndarray,
     scores: np.ndarray,
     class_ids: np.ndarray,
     iou_threshold: float,
 ) -> list[int]:
-    """NMS applied independently per class so boxes of different classes
-    never suppress each other."""
     if boxes.shape[0] == 0:
         return []
 
@@ -423,12 +470,18 @@ def _class_aware_nms(
     return keep
 
 
+# np.ndarray _nms(np.ndarray boxes, np.ndarray scores, float iou_threshold)
+# Inputs: np.ndarray boxes - (N, 4) xyxy boxes, all of a single class
+#         np.ndarray scores - (N,) confidence scores, one per box
+#         float iou_threshold - IoU above which a lower-scoring box is suppressed by a
+#                 higher-scoring one
+# Outputs: np.ndarray - indices into `boxes`/`scores` to keep, highest score first
+# Description: Greedy single-class non-maximum suppression implemented in pure numpy (no
+#              cv2/torch NMS dependency): repeatedly takes the highest-remaining-score box,
+#              keeps it, and removes any remaining box whose IoU with it exceeds
+#              `iou_threshold`.
+# Side Effects: None (pure function of its inputs).
 def _nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> np.ndarray:
-    """Greedy single-class NMS in pure numpy (no cv2/torch NMS dependency).
-
-    `boxes` is `(N, 4)` xyxy, `scores` is `(N,)`. Returns indices into
-    `boxes`/`scores` to keep, highest score first.
-    """
     if boxes.shape[0] == 0:
         return np.empty((0,), dtype=np.int64)
 
@@ -458,11 +511,16 @@ def _nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> np.ndar
     return np.array(keep, dtype=np.int64)
 
 
+# Optional[int] _static_input_size(Optional[Sequence[object]] shape)
+# Inputs: Optional[Sequence[object]] shape - the ONNX-declared input shape (e.g. from
+#                 `session.get_inputs()[0].shape`), possibly containing symbolic/dynamic dims
+# Outputs: Optional[int] - the static square spatial size (e.g. 640), or None if the shape is
+#          missing, not 4D, dynamic, or non-square
+# Description: Extracts a usable static input size from a declared ONNX input shape so the
+#              caller can fall back to `cfg.input_size` when the model's shape doesn't pin one
+#              down.
+# Side Effects: None (pure function of its input).
 def _static_input_size(shape: Optional[Sequence[object]]) -> Optional[int]:
-    """Return the model's static square spatial input size (e.g. 640 for an
-    input shaped `[1, 3, 640, 640]`), or None if the shape is missing,
-    non-4D, dynamic (a symbolic dim shows up as a non-int), or non-square --
-    any of which means the caller should fall back to config."""
     if shape is None or len(shape) != 4:
         return None
     h, w = shape[2], shape[3]
@@ -481,6 +539,23 @@ class OnnxYoloDetector(Detector):
     legacy YOLOv8 export or an end-to-end YOLO26 export (see
     `DetectorConfig.layout`)."""
 
+    # None __init__(DetectorConfig cfg, Optional[Sequence[str]] class_names)
+    # Inputs: DetectorConfig cfg - detector configuration: model path, providers, input size,
+    #                 layout, thresholds, and severity map
+    #         Optional[Sequence[str]] class_names - default None. Ordered class names matching
+    #                 the model's output index order; falls back to `DEFAULT_CLASS_NAMES` when
+    #                 not given
+    # Outputs: None
+    # Description: Loads the ONNX detection model into an onnxruntime InferenceSession,
+    #              determines the model's input size (its static declared shape if available,
+    #              else `cfg.input_size`), and resolves the output layout once via
+    #              `_resolve_layout` (using `cfg.layout` and the model's declared output
+    #              shape) so it never needs to be re-detected per-frame.
+    # Side Effects: Reads `cfg.model_path` from disk; raises `FileNotFoundError` if it doesn't
+    #               exist. Constructs an `onnxruntime.InferenceSession` (allocates model
+    #               resources). Logs an info message describing the resolved layout. Mutates
+    #               the new instance's state (`_cfg`, `_class_names`, `_session`,
+    #               `_input_name`, `_input_size`, `_layout`).
     def __init__(self, cfg: DetectorConfig, class_names: Optional[Sequence[str]] = None) -> None:
         self._cfg = cfg
         self._class_names: tuple[str, ...] = tuple(class_names) if class_names is not None else DEFAULT_CLASS_NAMES
@@ -511,6 +586,20 @@ class OnnxYoloDetector(Detector):
             else f"auto-detected from declared output shape {declared_output_shape}",
         )
 
+    # DetectionResult infer(Frame frame)
+    # Inputs: Frame frame - the captured camera frame to run detection on
+    # Outputs: DetectionResult - detections from whichever postprocessing path matches the
+    #          resolved layout (see `postprocess`/`postprocess_end2end`), plus the measured
+    #          inference time in milliseconds
+    # Description: Runs the full detect pipeline for one frame: `preprocess` builds the
+    #              letterboxed model input blob, the ONNX session runs inference, and then
+    #              either `postprocess_end2end` (YOLO26, no NMS) or `postprocess` (YOLOv8,
+    #              with class-aware NMS) is dispatched based on `self._layout`, resolved once
+    #              at construction time. Only a CATASTROPHIC-severity detection here would ever
+    #              raise `p_failure`.
+    # Side Effects: Runs ONNX model inference (CPU/GPU work via `self._session.run`); reads
+    #               `time.perf_counter()` to measure elapsed time. Raises `RuntimeError` if the
+    #               detector has already been `close()`d.
     def infer(self, frame: Frame) -> DetectionResult:
         if self._session is None:
             raise RuntimeError("OnnxYoloDetector is closed")
@@ -545,5 +634,13 @@ class OnnxYoloDetector(Detector):
         inference_ms = (time.perf_counter() - start) * 1000.0
         return DetectionResult(detections=detections, inference_ms=inference_ms)
 
+    # None close()
+    # Inputs: None
+    # Outputs: None
+    # Description: Releases the ONNX InferenceSession so `infer` can no longer be called on
+    #              this instance.
+    # Side Effects: Mutates instance state, dropping the reference to `self._session` (allowing
+    #               the underlying onnxruntime resources to be garbage-collected). Subsequent
+    #               `infer` calls will raise `RuntimeError`.
     def close(self) -> None:
         self._session = None

@@ -89,36 +89,55 @@ class DetectionResult:
     detections: tuple[Detection, ...]
     inference_ms: float
 
+    # DetectionResult empty(cls, float inference_ms=0.0)
+    # Inputs: float inference_ms - inference duration to record; defaults to 0.0 (e.g. when
+    #                               inference was skipped entirely)
+    # Outputs: DetectionResult - a result carrying no detections
+    # Description: Convenience constructor for representing "no detections" (e.g. the quality
+    #              gate blocked the frame or the printer wasn't printing).
+    # Side Effects: None
     @classmethod
     def empty(cls, inference_ms: float = 0.0) -> DetectionResult:
-        """Build a result with no detections (e.g. inference was skipped)."""
         return cls(detections=(), inference_ms=inference_ms)
 
+    # tuple[Detection, ...] catastrophic(self)
+    # Inputs: None
+    # Outputs: tuple[Detection, ...] - subset of self.detections with severity CATASTROPHIC
+    # Description: Filters this frame's detections down to catastrophic-severity ones.
+    # Side Effects: None
     @property
     def catastrophic(self) -> tuple[Detection, ...]:
-        """Detections classified as catastrophic severity."""
         return tuple(d for d in self.detections if d.severity is Severity.CATASTROPHIC)
 
+    # tuple[Detection, ...] cosmetic(self)
+    # Inputs: None
+    # Outputs: tuple[Detection, ...] - subset of self.detections with severity COSMETIC
+    # Description: Filters this frame's detections down to cosmetic-severity ones.
+    # Side Effects: None
     @property
     def cosmetic(self) -> tuple[Detection, ...]:
-        """Detections classified as cosmetic severity."""
         return tuple(d for d in self.detections if d.severity is Severity.COSMETIC)
 
+    # float p_failure(self)
+    # Inputs: None
+    # Outputs: float - max confidence among catastrophic detections, or 0.0 if there are none
+    # Description: Primary failure signal fed into the DecisionEngine; cosmetic detections never
+    #              contribute to it.
+    # Side Effects: None
     @property
     def p_failure(self) -> float:
-        """Max confidence among catastrophic detections, or 0.0 if there are none.
-
-        This is the primary signal fed into the DecisionEngine; cosmetic
-        detections do not contribute to it.
-        """
         catastrophic = self.catastrophic
         if not catastrophic:
             return 0.0
         return max(d.confidence for d in catastrophic)
 
+    # Optional[Detection] top(self)
+    # Inputs: None
+    # Outputs: Optional[Detection] - highest-confidence catastrophic detection, or None if none
+    # Description: Picks the single most-confident catastrophic detection for this frame.
+    # Side Effects: None
     @property
     def top(self) -> Optional[Detection]:
-        """Highest-confidence catastrophic detection, or None if there isn't one."""
         catastrophic = self.catastrophic
         if not catastrophic:
             return None
@@ -149,9 +168,13 @@ class PrintState:
     progress: float  # 0..1
     fetched_at: float  # unix time this snapshot was fetched
 
+    # bool is_printing(self)
+    # Inputs: None
+    # Outputs: bool - True if the printer is actively printing
+    # Description: Convenience check for whether this snapshot is eligible for detection.
+    # Side Effects: None
     @property
     def is_printing(self) -> bool:
-        """True if the printer is actively printing (and thus eligible for detection)."""
         return self.state is PrinterState.PRINTING
 
 
@@ -162,14 +185,22 @@ class GateResult:
     passed: bool
     reason: Optional[str]
 
+    # GateResult ok(cls)
+    # Inputs: None
+    # Outputs: GateResult - a passing gate result (passed=True, reason=None)
+    # Description: Convenience constructor for a passing quality-gate result.
+    # Side Effects: None
     @classmethod
     def ok(cls) -> GateResult:
-        """A passing gate result."""
         return cls(passed=True, reason=None)
 
+    # GateResult blocked(cls, str reason)
+    # Inputs: str reason - human-readable explanation for why the gate blocked the frame
+    # Outputs: GateResult - a blocking gate result (passed=False, reason=reason)
+    # Description: Convenience constructor for a blocking quality-gate result.
+    # Side Effects: None
     @classmethod
     def blocked(cls, reason: str) -> GateResult:
-        """A blocking gate result with a human-readable explanation."""
         return cls(passed=False, reason=reason)
 
 
@@ -208,13 +239,14 @@ class Event:
     elapsed_s: Optional[float]
     detections: tuple[Detection, ...]
 
+    # dict to_dict(self)
+    # Inputs: None
+    # Outputs: dict - fully JSON-serializable representation of this event
+    # Description: Reduces enums to their .value, detections to plain dicts, and bboxes to lists
+    #              of floats so the result can be passed directly to json.dumps or a Discord
+    #              embed payload.
+    # Side Effects: None
     def to_dict(self) -> dict:
-        """Fully JSON-serializable representation of this event.
-
-        Enums are reduced to their `.value`, detections to a list of plain
-        dicts, and bboxes to lists of floats -- safe to pass straight to
-        `json.dumps` or a Discord embed payload.
-        """
         return {
             "timestamp": self.timestamp,
             "action": self.action.value,
