@@ -26,7 +26,7 @@ from training.train import DEFAULT_DATA_YAML, parse_args, resolve_task, validate
 def test_parse_args_defaults():
     args = parse_args([])
     assert args.data == DEFAULT_DATA_YAML
-    assert args.weights == "yolov8n.pt"
+    assert args.weights == "yolo26n.pt"
     assert args.task is None
     assert args.epochs == 100
     assert args.batch == 32

@@ -37,7 +37,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Path to data.yaml (detect) or a classification dataset directory (classify) "
         f"(default: {DEFAULT_DATA_YAML})",
     )
-    parser.add_argument("--weights", type=str, default="yolov8n.pt", help="Starting weights (default: yolov8n.pt, pretrained on COCO)")
+    parser.add_argument("--weights", type=str, default="yolo26n.pt", help="Starting weights (default: yolo26n.pt, pretrained on COCO)")
     parser.add_argument(
         "--task",
         type=str,
@@ -53,8 +53,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--patience", type=int, default=20, help="Early-stopping patience (epochs with no val improvement)")
     parser.add_argument("--project", type=Path, default=DEFAULT_PROJECT, help=f"Ultralytics project dir (default: {DEFAULT_PROJECT})")
-    parser.add_argument("--name", type=str, default="argus_yolov8n", help="Run name (subdir of --project)")
+    parser.add_argument("--name", type=str, default="argus_yolo26n", help="Run name (subdir of --project)")
     parser.add_argument("--fliplr", type=float, default=0.5, help="Horizontal-flip augmentation probability (default: 0.5)")
+    parser.add_argument(
+        "--cos-lr",
+        dest="cos_lr",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Cosine learning-rate schedule (default: on).",
+    )
+    parser.add_argument(
+        "--close-mosaic",
+        type=int,
+        default=10,
+        help="Disable mosaic augmentation for the final N epochs (default: 10). Mosaic helps "
+        "early and hurts convergence at the end; 0 leaves it on throughout.",
+    )
     parser.add_argument(
         "--optimizer",
         type=str,
@@ -165,7 +179,8 @@ def main(argv: list[str] | None = None) -> None:
         f"[train] Starting training: task={task} data={args.data} epochs={args.epochs} batch={args.batch} "
         f"imgsz={args.imgsz} device={args.device} seed={args.seed} patience={args.patience} "
         f"optimizer={args.optimizer} lr0={args.lr0} "
-        f"flipud=0.0 (disabled -- a print is never upside down) fliplr={args.fliplr}"
+        f"flipud=0.0 (disabled -- a print is never upside down) fliplr={args.fliplr} "
+        f"cos_lr={args.cos_lr} close_mosaic={args.close_mosaic}"
     )
     results = model.train(
         data=str(args.data),
@@ -183,6 +198,8 @@ def main(argv: list[str] | None = None) -> None:
         fliplr=args.fliplr,
         optimizer=args.optimizer,
         lr0=args.lr0,
+        cos_lr=args.cos_lr,
+        close_mosaic=args.close_mosaic,
     )
 
     save_dir = Path(results.save_dir) if hasattr(results, "save_dir") else Path(args.project) / args.name

@@ -1,6 +1,6 @@
 """Exports a trained YOLO checkpoint (best.pt) to ONNX and verifies the output layout is one the runtime detector can parse: legacy YOLOv8 raw predictions ``(1, 4+num_classes, N)`` (or its transpose) or YOLO26's end-to-end/NMS-free ``(1, N, 6)`` rows. Reuses the runtime's own ``detect_layout()`` (src/argus/detectors/onnx_yolo.py) rather than re-deriving the shape rule, so verification can't drift out of sync with the runtime.
 
-Usage: python training/export_onnx.py --weights runs/train/argus_yolov8n/weights/best.pt [--imgsz 640]
+Usage: python training/export_onnx.py --weights runs/train/argus_yolo26n/weights/best.pt [--imgsz 640]
 """
 
 from __future__ import annotations

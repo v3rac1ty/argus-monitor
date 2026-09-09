@@ -29,8 +29,8 @@ camera:
 # replacement for the other; nothing outside this section needs to change.
 detector:
   kind: "detection"
-  model_path: "models/argus.onnx"
-  input_size: 512          # model is trained and exported at 512x512; dataset images are natively 512x512
+  model_path: "models/argus_multi.onnx"
+  input_size: 640          # model is trained and exported at 640x640
   providers: ["CPUExecutionProvider"]
   # Output contract of the ONNX model. Two supported models produce two
   # different raw output shapes:
@@ -50,36 +50,44 @@ detector:
   layout: "auto"
   nms_iou: 0.45
   default_threshold: 0.50
-  # Measured on the held-out test split by training/evaluate.py, which
-  # selects each class's threshold to hit a target precision of >= 0.95.
-  # These must be re-derived (re-run training/evaluate.py) whenever the
-  # model is retrained -- they are specific to the current weights, not
-  # general-purpose defaults. Measured operating points at these
-  # thresholds (from runs/evaluation.json):
+  # PLACEHOLDERS -- NOT YET MEASURED for the 7-class model.
+  # training/evaluate.py picks each class's threshold to hit precision >= 0.95
+  # on the held-out test split and must be re-run after every retrain; these
+  # numbers are specific to one set of weights, never general defaults.
+  # Until that run happens these are deliberately conservative (high = fires
+  # less often), and decision.action_mode stays notify_only, so an
+  # uncalibrated threshold cannot stop a print.
   class_thresholds:
-    spaghetti: 0.75         # P=0.656 R=0.065 -- target precision NOT met; best real operating point
-    warping: 0.76           # P=0.951 R=0.065 -- "met" on ~2 true detections (31 instances total); see severity note below
-    stringing: 0.30         # P=0.857 R=0.143 -- target precision NOT met; best real operating point
-    zits: 0.75              # P=0.921 R=0.056 -- target precision NOT met; best real operating point
-    "error extrusion": 0.64 # P=0.950 R=0.059 -- target precision MET
-  # Severity gates which classes are allowed to drive automated action
-  # (see decision.action_mode below); cosmetic classes are still detected
-  # and logged, they just cannot trigger a pause/cancel. spaghetti is the
-  # only catastrophic class right now.
+    spaghetti: 0.75         # placeholder -- re-derive
+    layer_separation: 0.75  # placeholder -- re-derive
+    bed_adhesion: 0.75      # placeholder -- re-derive
+    blob_of_death: 0.75     # placeholder -- re-derive
+    warping: 0.50           # placeholder -- re-derive
+    stringing: 0.50         # placeholder -- re-derive
+    error_extrusion: 0.50   # placeholder -- re-derive
+  # Severity gates which classes may drive automated action (see
+  # decision.action_mode below). Cosmetic classes are still detected and
+  # logged; they just cannot trigger a pause/cancel.
   #
-  # warping was demoted from catastrophic to cosmetic despite its
-  # apparent P=0.951 above: the held-out split has only 19 images / 31
-  # instances of warping in total, and that precision is measured at
-  # recall 0.065 -- roughly two true detections. That's statistical
-  # noise, not evidence a print should be stopped over. Promote it back
-  # to catastrophic only once a retrained model demonstrates genuine
-  # precision on a materially larger warping sample.
+  # The catastrophic set is a policy decision about which failures justify
+  # stopping a print, independent of how well the model currently detects
+  # them. All four destroy the part or risk the machine: spaghetti, a print
+  # detaching from the bed, delamination between layers, and a blob
+  # engulfing the hotend. Thresholds, not severity, are what stop a
+  # weakly-detected class from firing.
+  #
+  # warping stays cosmetic. It was demoted after the 5-class model showed
+  # P=0.951 at recall 0.065 -- roughly two true detections out of 31
+  # instances, which is noise rather than evidence. Promote it only once a
+  # retrained model earns it on a materially larger warping sample.
   severity:
     spaghetti: catastrophic
+    layer_separation: catastrophic
+    bed_adhesion: catastrophic
+    blob_of_death: catastrophic
     warping: cosmetic
     stringing: cosmetic
-    zits: cosmetic
-    "error extrusion": cosmetic
+    error_extrusion: cosmetic
 
   # --- Classification path ------
   # A classifier predicts one whole-frame label per frame instead of boxes.

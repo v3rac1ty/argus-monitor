@@ -66,27 +66,27 @@ def test_detector_defaults():
     config = load_config()
     det = config.detector
     assert det.kind == "detection"
-    assert det.model_path == "models/argus.onnx"
-    assert det.input_size == 512
+    assert det.model_path == "models/argus_multi.onnx"
+    assert det.input_size == 640
     assert det.providers == ("CPUExecutionProvider",)
     assert det.layout == "auto"
     assert det.class_names == ()
     assert det.nms_iou == 0.45
     assert det.default_threshold == 0.50
-    assert det.class_thresholds == {
-        "spaghetti": 0.75,
-        "warping": 0.76,
-        "stringing": 0.30,
-        "zits": 0.75,
-        "error extrusion": 0.64,
-    }
+    # Severity is policy and is asserted exactly; thresholds are measured
+    # per-weights by training/evaluate.py and change on every recalibration,
+    # so only their structure is pinned here.
     assert det.severity == {
         "spaghetti": Severity.CATASTROPHIC,
+        "layer_separation": Severity.CATASTROPHIC,
+        "bed_adhesion": Severity.CATASTROPHIC,
+        "blob_of_death": Severity.CATASTROPHIC,
         "warping": Severity.COSMETIC,
         "stringing": Severity.COSMETIC,
-        "zits": Severity.COSMETIC,
-        "error extrusion": Severity.COSMETIC,
+        "error_extrusion": Severity.COSMETIC,
     }
+    assert set(det.class_thresholds) == set(det.severity)
+    assert all(0.0 <= t <= 1.0 for t in det.class_thresholds.values())
 
 
 def test_decision_defaults():
@@ -355,18 +355,23 @@ def test_valid_config_round_trips():
     assert config.detector.severity["spaghetti"] == Severity.CATASTROPHIC
 
 
-def test_spaghetti_is_the_only_catastrophic_class():
-    """Pins the current safety posture: on the measured evaluation results,
-    only spaghetti has earned the right to be treated as catastrophic (able
-    to drive pause/cancel). Every other class -- including warping, which
-    was demoted after its high apparent precision turned out to be ~2 true
-    detections on a 31-instance sample -- must stay cosmetic until a
-    retrained model demonstrates genuine precision on a larger sample. This
-    guards against a future edit silently re-arming an unproven class."""
+def test_catastrophic_set_is_pinned():
+    """Pins the safety posture: exactly these four failures may drive
+    pause/cancel, because each destroys the part or risks the machine.
+    Everything else stays cosmetic -- notably warping, demoted after its high
+    apparent precision turned out to be ~2 true detections on a 31-instance
+    sample, and not promoted again until a retrained model earns it on a
+    materially larger sample. Guards against an edit silently arming a class."""
     config = load_config()
-    catastrophic = [
+    catastrophic = {
         name
         for name, severity in config.detector.severity.items()
         if severity == Severity.CATASTROPHIC
-    ]
-    assert catastrophic == ["spaghetti"]
+    }
+    assert catastrophic == {
+        "spaghetti",
+        "layer_separation",
+        "bed_adhesion",
+        "blob_of_death",
+    }
+    assert config.detector.severity["warping"] == Severity.COSMETIC
