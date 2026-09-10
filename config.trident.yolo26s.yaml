@@ -1,0 +1,228 @@
+# Argus Monitor configuration for a Voron Trident, running the trained
+# YOLO26s-cls binary (failure/normal) whole-frame classifier -- the model
+# targeted at the Raspberry Pi 5 AI HAT+ (Hailo-8, 26 TOPS). This is a
+# sibling of config.trident.yaml (which runs the incumbent ResNet18 model on
+# CPU), not a replacement for it -- keep both until the Hailo HEF path in
+# docs/hailo-deployment.md is compiled and re-validated on real hardware.
+#
+# Calibrated against the real measured artifacts:
+#   - runs/train/yolo26s_cls_bin_v2/weights/best.pt   (winning retrain, see below)
+#   - models/yolo26s_cls_bin_opset11.onnx             (opset-11 export, static 1x3x320x320 input)
+#   - runs/eval_yolo26s_final.json                    (test-split evaluation report)
+#   - runs/eval_yolo26s_final_finesweep.json          (0.95-0.9999 confidence sweep that
+#     located the zero-false-positive threshold used below)
+#
+# Provenance of "the winning retrain": training/train.py --task classify was
+# run 3 times against datasets/argus_bin (--epochs 60 --patience 20 --imgsz 320
+# --device mps), varying only --lr0 and --epochs/--patience, and the winner
+# was picked on VALIDATION top-1 (never on test, to avoid leakage):
+#   - yolo26s_cls_bin_v2     (lr0=0.001 default, epochs=60,  patience=20): val top1 0.98187 @ epoch 13  <- WINNER
+#   - yolo26s_cls_bin_lowlr  (lr0=0.0005,        epochs=60,  patience=20): val top1 0.97885 @ epoch 11
+#   - yolo26s_cls_bin_long   (lr0=0.001 default, epochs=100, patience=30): val top1 0.97583 @ epoch 16
+# All three comfortably beat the FIRST yolo26s run's val top1 of 0.96979,
+# which early-stopped at epoch 11 of 40 with best at epoch 3 because that run
+# used --patience 8 (a bug in how it was invoked, not a model limitation) --
+# see runs/classify/runs/train/yolo26s_cls_bin/args.yaml.
+#
+# On the held-out TEST split (331 images, 95 failure / 236 normal), the
+# winner measures top-1 0.9789 (324/331) -- tied with, not better than, the
+# first yolo26s run's 0.9789 -- but with 3 false positives instead of 4
+# (confusion matrix [[91,4],[3,233]] vs the first run's [[92,3],[4,232]]):
+# one fewer false alarm on the 236 normal test images, at the cost of one
+# more missed failure. Still behind the incumbent ResNet18
+# (models/argus_bin_opset11.onnx), which measures 1 false positive on the
+# same-sized test split -- see docs/hailo-deployment.md for the full
+# comparison table and the fallback guidance that entails.
+#
+# Any string value of the exact form "env:VAR_NAME" is replaced at load time
+# with os.environ["VAR_NAME"] (or None if that variable is unset). Use this
+# to keep secrets such as the Discord webhook URL out of version control.
+
+# Camera capture: where frames come from and at what size/rate.
+camera:
+  source: "0"              # "0"=/dev/video0, an http(s) MJPEG/snapshot URL, or a directory path for replay
+  width: 1280
+  height: 720
+  fps: 5
+  reconnect_backoff_s: 2.0
+  max_reconnect_backoff_s: 30.0
+
+# ONNX detector: models/yolo26s_cls_bin_opset11.onnx, a whole-frame binary
+# classifier (failure vs. normal), exported at opset 11 (mandatory for
+# Hailo's ONNX parser -- see docs/hailo-deployment.md) from the Ultralytics
+# YOLO26s-cls checkpoint. Runs on ONNX Runtime/CPU today; switching to the
+# Hailo-8 NPU is the commented-out "kind: hailo" block below, a one-line
+# change once the .hef is compiled (see docs/hailo-deployment.md).
+#
+# class_thresholds and severity must list exactly the same class names --
+# every class needs both a threshold and a severity, or config loading will
+# fail (see argus.config._validate, which checks
+# set(class_thresholds) == set(severity)).
+detector:
+  kind: "classification"
+  model_path: "models/yolo26s_cls_bin_opset11.onnx"
+  # Model is exported with a STATIC input of (1, 3, 320, 320); ClassifierDetector
+  # reads the static shape straight off the ONNX graph and this value is only
+  # the fallback if that ever fails, but it must still match the training/export
+  # size.
+  input_size: 320
+  providers: ["CPUExecutionProvider"]
+  # This order is not arbitrary -- it is the model's REAL output index order,
+  # embedded in the ONNX metadata itself. Read directly off
+  # models/yolo26s_cls_bin_opset11.onnx via onnxruntime's own
+  # get_modelmeta().custom_metadata_map["names"] for this file (not assumed
+  # from Ultralytics' usual alphabetical convention, though it happens to
+  # agree here): "{0: 'failure', 1: 'normal'}". Input node is "images"
+  # (1,3,320,320 float32 NCHW, [0,1]-scaled); output node is "output0"
+  # (1,2), and -- unlike the ResNet18/tinygrad ONNX path's "logits" output --
+  # this graph's own final op is a Softmax, so output0 is ALREADY a valid
+  # probability distribution (verified: sums to 1.0 on a random input), not
+  # raw logits. argus.detectors.classifier.resolve_class_names() cross-checks
+  # this list against the same metadata at load time and raises ValueError
+  # on any mismatch, so getting this order wrong fails loudly at startup
+  # rather than silently mislabeling every prediction.
+  class_names: ["failure", "normal"]
+  default_threshold: 0.50
+  class_thresholds:
+    # 0.99723 is not a round-number guess -- it is a measured value from
+    # runs/eval_yolo26s_final_finesweep.json's confidence sweep (extended
+    # locally to 0.000005 resolution to pin the exact boundary): on the
+    # 331-image held-out test split, false positives on the 236 normal
+    # images do not reach zero until somewhere in (0.997205, 0.99726) --
+    # 0.99723 sits in that window, giving PRECISION 1.000 / ZERO false
+    # positives with the maximum recall available at that operating
+    # point, 0.779 (74/95 failures caught). Below 0.997205 there is at
+    # least 1 false positive on this test split; at or above ~0.99726,
+    # recall drops further to 0.768 (73/95) for no additional precision.
+    #
+    # PROMINENT WARNING: this threshold sits extremely close to the
+    # softmax ceiling of 1.0 -- a direct consequence of this model's own
+    # output distribution, not a config mistake. See
+    # docs/hailo-deployment.md's warning on why that makes this specific
+    # operating point fragile under INT8 quantization once compiled for
+    # the Hailo-8: it MUST be re-derived on the quantized model before
+    # this config (or its "kind: hailo" sibling below) is trusted, and it
+    # may not be reachable at all post-quantization. If it isn't, fall
+    # back to the ResNet18 model (config.trident.yaml, threshold 0.75,
+    # measured with real margin on both sides of its own zero-FP boundary)
+    # rather than shipping an unvalidated near-1.0 threshold.
+    failure: 0.99723
+    # Never consulted: postprocess_classify() short-circuits any "normal"
+    # argmax to zero detections before any threshold is checked (see
+    # ClassifierDetector module docstring). Listed only because
+    # class_thresholds and severity must define exactly the same class-name
+    # set, or argus.config.ConfigError is raised at load time.
+    normal: 0.50
+  severity:
+    # The only catastrophic class -- a "failure" prediction above threshold
+    # is the sole signal that can ever reach the DecisionEngine's p_failure
+    # (see DetectionResult.p_failure: max confidence among CATASTROPHIC
+    # detections only).
+    failure: catastrophic
+    # Never consulted at runtime (see class_thresholds.normal above for why
+    # it's still listed) -- a "normal" prediction produces zero Detections,
+    # not a cosmetic one.
+    normal: cosmetic
+
+# -----------------------------------------------------------------------
+# Future: once the Hailo-8 .hef is compiled (docs/hailo-deployment.md) and
+# its OWN zero-FP threshold has been re-derived on-device (mandatory -- INT8
+# quantization shifts the confidence distribution, see the warning above and
+# docs/hailo-deployment.md), switching to the Hailo-8 NPU is this one block
+# replacing the "detector:" section above, nothing else in this file changes:
+# -----------------------------------------------------------------------
+# detector:
+#   kind: "hailo"
+#   model_path: "models/yolo26s_cls_bin.hef"
+#   input_size: 320
+#   class_names: ["failure", "normal"]   # same order as above -- a compiled HEF carries no
+#                                         # embedded metadata for HailoDetector to cross-check
+#                                         # against, so this MUST match the ONNX export's real
+#                                         # order (verified above) or every prediction is
+#                                         # silently mislabeled with no error at load time.
+#   default_threshold: 0.50
+#   class_thresholds:
+#     failure: 0.99723   # PLACEHOLDER ONLY -- re-derive on the quantized model per
+#                         # docs/hailo-deployment.md before trusting this. INT8 quantization
+#                         # shifting the confidence distribution is especially consequential at
+#                         # an operating point this close to 1.0 -- see the warning above.
+#     normal: 0.50
+#   severity:
+#     failure: catastrophic
+#     normal: cosmetic
+
+# Temporal DecisionEngine: turns a stream of per-frame classifier scores into
+# a smoothed score and, eventually, an action (notify / pause / cancel).
+#
+# UNCHANGED from config.trident.yaml, carried over as-is -- NOT re-calibrated
+# for this model. tools/calibrate.py's sweep that picked these values (see
+# config.trident.yaml's own comment) was run against the ResNet18 model's
+# raw p_failure signal, which ranges from 0.75 (its own class_thresholds.failure)
+# up to 1.0. This model's raw p_failure signal instead only ever appears in
+# the far narrower [0.99723, 1.0] band (anything below the detector's own
+# threshold is already zeroed out before the DecisionEngine ever sees it) --
+# every one of pause_score (0.75), warn_score (0.60), and cancel_score (0.92)
+# is trivially cleared by the FIRST raw positive tick this model ever
+# produces, which changes the qualitative vote-accumulation behavior these
+# values were tuned for. Re-run tools/calibrate.py against this model's own
+# real p_failure distribution before enabling anything beyond notify_only.
+decision:
+  tick_interval_s: 1.0
+  warmup_s: 180
+  ema_alpha: 0.35
+  window: 12
+  vote_threshold: 0.55
+  warn_score: 0.60
+  warn_votes: 4
+  pause_score: 0.75
+  pause_votes: 6
+  pause_consecutive: 3
+  cancel_score: 0.92
+  cancel_votes: 9
+  cancel_consecutive: 2
+  cancel_enabled: false
+  clear_score: 0.40
+  clear_ticks: 5
+  cooldown_s: 300
+  # notify_only MUST ship as the default here, for at least two independent
+  # reasons: (1) the same real-footage-calibration gap config.trident.yaml
+  # documents (these are public-dataset stills, not recorded Voron Trident
+  # footage), and (2) decision: above is carried over unmodified and, per
+  # the comment there, has not been re-calibrated for this model's own
+  # narrow-band p_failure signal. Do not raise this above notify_only until
+  # both gaps are closed.
+  action_mode: "notify_only"   # notify_only | pause | cancel -- ceiling on automated action
+
+# Pre-inference frame quality gate: reject frames too dark/bright/blurry/stale
+# to trust, rather than feeding garbage into the detector and decision engine.
+quality:
+  min_mean_luma: 20.0
+  max_mean_luma: 240.0
+  min_blur_var: 45.0
+  max_frame_age_s: 5.0
+
+# Moonraker (Klipper API) connection used to poll print state and, if
+# action_mode allows it, pause/cancel the print.
+moonraker:
+  base_url: "http://localhost:7125"
+  timeout_s: 5.0
+  poll_interval_s: 1.0
+  pause_macro: null        # e.g. "DETECTION_PAUSE" to call a gcode macro instead of the raw pause endpoint
+
+# Discord webhook notifications. discord_webhook_url is loaded from the
+# DISCORD_WEBHOOK_URL environment variable so it never ends up committed.
+notify:
+  discord_webhook_url: "env:DISCORD_WEBHOOK_URL"
+  attach_frame: true
+  min_interval_s: 60
+
+# Local storage: where the JSONL event log and captured frames are written,
+# and how much of that to keep.
+storage:
+  event_log: "logs/events.jsonl"
+  frame_dir: "captures"
+  max_frames: 500
+  retention_days: 14
+
+logging:
+  level: "INFO"

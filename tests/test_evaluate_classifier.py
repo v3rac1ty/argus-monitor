@@ -41,6 +41,7 @@ from training.evaluate_classifier import (
     per_class_prf1,
     resolve_catastrophic_class_index,
     resolve_report_class_order,
+    run_inference_hailo,
     run_inference_onnx,
     select_backend,
     sweep_catastrophic,
@@ -414,6 +415,14 @@ def test_select_backend_no_suffix_defaults_to_ultralytics():
     assert select_backend(Path("weights_dir")) == "ultralytics"
 
 
+def test_select_backend_hef_suffix():
+    assert select_backend(Path("model.hef")) == "hailo"
+
+
+def test_select_backend_hef_suffix_case_insensitive():
+    assert select_backend(Path("model.HEF")) == "hailo"
+
+
 # --------------------------------------------------------------------------
 # resolve_report_class_order -- 6-class vs binary generalisation
 # --------------------------------------------------------------------------
@@ -752,3 +761,170 @@ def test_run_inference_onnx_missing_class_metadata_raises(tmp_path, monkeypatch)
     # Session.run must never have been reached -- fail loudly before any
     # inference, not partway through.
     assert fake_session.run_call_count == 0
+
+
+# --------------------------------------------------------------------------
+# run_inference_hailo -- a minimal fake hailo_platform module, matching the
+# style of tests/test_hailo_detector.py's fakes (same sys.modules-injection
+# trick), so the Hailo backend can be exercised with no real HailoRT package
+# and no Hailo-8 hardware.
+# --------------------------------------------------------------------------
+
+
+class _FakeHailoVStreamInfo:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeHailoContextManager:
+    def __enter__(self) -> "_FakeHailoContextManager":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+class _FakeHailoInferPipeline(_FakeHailoContextManager):
+    def __init__(self, network_group: Any, input_params: Any, output_params: Any, output_by_input_sum: dict) -> None:
+        self.network_group = network_group
+        self._output_by_input_sum = output_by_input_sum
+        self.infer_calls: list[dict] = []
+
+    def infer(self, input_data: dict) -> dict:
+        self.infer_calls.append(input_data)
+        blob = next(iter(input_data.values()))
+        # Route to a caller-controlled output keyed by the input blob's sum,
+        # so different (fake) images can be made to produce different
+        # outputs, matching how a real model would vary output with input.
+        key = int(blob.sum()) % len(self._output_by_input_sum)
+        return {"output_layer1": self._output_by_input_sum[key]}
+
+
+class _FakeHailoNetworkGroup:
+    def create_params(self) -> str:
+        return "params"
+
+    def activate(self, params: Any) -> _FakeHailoContextManager:
+        return _FakeHailoContextManager()
+
+
+class _FakeHailoHEF:
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def get_input_vstream_infos(self) -> list[_FakeHailoVStreamInfo]:
+        return [_FakeHailoVStreamInfo("input_layer1")]
+
+    def get_output_vstream_infos(self) -> list[_FakeHailoVStreamInfo]:
+        return [_FakeHailoVStreamInfo("output_layer1")]
+
+
+class _FakeHailoVDevice:
+    def __init__(self, network_group: _FakeHailoNetworkGroup) -> None:
+        self._network_group = network_group
+
+    def configure(self, hef: Any, configure_params: Any) -> list[_FakeHailoNetworkGroup]:
+        return [self._network_group]
+
+    def release(self) -> None:
+        pass
+
+
+def _install_fake_hailo_platform_module(monkeypatch: pytest.MonkeyPatch, outputs: list[np.ndarray]) -> None:
+    """Registers a fake `hailo_platform` in sys.modules, cycling through
+    `outputs` (indexed by the input blob's pixel sum modulo len(outputs)) so
+    a multi-image run_inference_hailo call can be driven deterministically
+    without a real HEF or device."""
+    import sys
+    import types
+
+    network_group = _FakeHailoNetworkGroup()
+    vdevice = _FakeHailoVDevice(network_group)
+    output_by_key = {i: out for i, out in enumerate(outputs)}
+
+    fake_module = types.ModuleType("hailo_platform")
+    fake_module.HEF = _FakeHailoHEF  # type: ignore[attr-defined]
+    fake_module.VDevice = lambda: vdevice  # type: ignore[attr-defined]
+    fake_module.ConfigureParams = type("CP", (), {"create_from_hef": staticmethod(lambda hef, interface: None)})  # type: ignore[attr-defined]
+    fake_module.HailoStreamInterface = type("HSI", (), {"PCIe": "PCIe"})  # type: ignore[attr-defined]
+    fake_module.FormatType = type("FT", (), {"UINT8": "UINT8", "FLOAT32": "FLOAT32"})  # type: ignore[attr-defined]
+    fake_module.InputVStreamParams = type("IVP", (), {"make": staticmethod(lambda ng, quantized, format_type: None)})  # type: ignore[attr-defined]
+    fake_module.OutputVStreamParams = type("OVP", (), {"make": staticmethod(lambda ng, quantized, format_type: None)})  # type: ignore[attr-defined]
+    fake_module.InferVStreams = lambda ng, ip, op: _FakeHailoInferPipeline(ng, ip, op, output_by_key)  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "hailo_platform", fake_module)
+
+
+def _fake_hef_path(tmp_path: Path) -> Path:
+    """A path that merely needs to exist -- HailoDetector only checks
+    is_file() before handing it to the (fake) hailo_platform.HEF
+    constructor; its bytes are never actually parsed as a real HEF."""
+    path = tmp_path / "model.hef"
+    path.write_bytes(b"")
+    return path
+
+
+def test_run_inference_hailo_returns_correctly_shaped_probs(tmp_path, monkeypatch):
+    class_names = ("failure", "normal")
+    # Two distinct outputs so the two (distinctly-colored) test images can be
+    # told apart through the fake pipeline's pixel-sum routing.
+    _install_fake_hailo_platform_module(
+        monkeypatch,
+        outputs=[
+            np.array([0.9, 0.1], dtype=np.float32),
+            np.array([0.2, 0.8], dtype=np.float32),
+        ],
+    )
+
+    image_paths = [tmp_path / "img_0.png", tmp_path / "img_1.png"]
+    _write_tiny_image(image_paths[0], size=32)
+    # A different, non-random image so its pixel sum (mod 2) differs from
+    # the first and routes to the other fake output.
+    cv2.imwrite(str(image_paths[1]), np.full((32, 32, 3), 200, dtype=np.uint8))
+
+    probs, names = run_inference_hailo(_fake_hef_path(tmp_path), image_paths, imgsz=32, class_names=class_names)
+
+    assert probs.shape == (2, 2)
+    assert names == {0: "failure", 1: "normal"}
+    for row in probs:
+        assert row.sum() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_run_inference_hailo_uses_hailo_specific_preprocessing(tmp_path, monkeypatch):
+    # Spy on the real preprocess_classify_hailo (imported by
+    # argus.detectors.hailo, called via HailoDetector.predict_proba) to
+    # prove the Hailo backend does NOT reuse the ONNX float32/NCHW
+    # preprocessing -- reusing that blindly would feed a HEF the wrong dtype
+    # and layout with no error raised.
+    from argus.detectors import hailo as hailo_module
+
+    _install_fake_hailo_platform_module(monkeypatch, outputs=[np.array([0.5, 0.5], dtype=np.float32)])
+
+    calls: list[np.ndarray] = []
+    real_preprocess = hailo_module.preprocess_classify_hailo
+
+    def spy_preprocess(image, input_size):
+        blob = real_preprocess(image, input_size)
+        calls.append(blob)
+        return blob
+
+    monkeypatch.setattr(hailo_module, "preprocess_classify_hailo", spy_preprocess)
+
+    image_path = tmp_path / "img.png"
+    _write_tiny_image(image_path, size=32)
+
+    run_inference_hailo(_fake_hef_path(tmp_path), [image_path], imgsz=32, class_names=("failure", "normal"))
+
+    assert len(calls) == 1
+    blob = calls[0]
+    assert blob.dtype == np.uint8
+    assert blob.shape == (1, 32, 32, 3)  # NHWC, not the ONNX path's NCHW
+
+
+def test_run_inference_hailo_class_names_required_by_main(tmp_path):
+    # main() itself (not run_inference_hailo) enforces --class-names for the
+    # hailo backend, since a HEF has no metadata to fall back on -- this is
+    # covered at the CLI/main level, but run_inference_hailo itself simply
+    # trusts whatever class_names it's given.
+    with pytest.raises(TypeError):
+        run_inference_hailo(tmp_path / "model.hef", [], imgsz=32)  # type: ignore[call-arg]

@@ -38,21 +38,26 @@ _PROB_SUM_TOLERANCE = 1e-3
 # --------------------------------------------------------------------------
 
 
-# np.ndarray preprocess_classify(np.ndarray image, int input_size)
-# Inputs: np.ndarray image - source BGR frame (HxWx3, uint8) to preprocess
+# np.ndarray resize_and_center_crop(np.ndarray image, int input_size)
+# Inputs: np.ndarray image - source BGR frame (HxWx3, uint8) to crop
 #         int input_size - target square spatial size the model expects
-# Outputs: np.ndarray - a (1, 3, input_size, input_size) float32 blob in [0, 1], RGB,
-#          channel-first
-# Description: Resizes `image` so its short side equals `input_size`, center-crops to
-#              input_size x input_size, converts BGR->RGB and HWC->CHW, scales to [0, 1], and
-#              adds a batch dimension. Must exactly mirror the classification dataset builder's
-#              training-time preprocessing (resize-short-side + center-crop) -- NOT the
-#              letterboxing `onnx_yolo.preprocess` uses for the detection path.
+# Outputs: np.ndarray - a (input_size, input_size, 3) BGR uint8 array
+# Description: Resizes `image` so its short side equals `input_size`, then center-crops to
+#              input_size x input_size. This is the geometry step shared by every backend --
+#              `preprocess_classify` (ONNX, float32 NCHW in [0, 1]) and
+#              `argus.detectors.hailo.preprocess_classify_hailo` (Hailo HEF, uint8 NHWC) both
+#              call this exact function before diverging on dtype/layout/normalization, so the
+#              two backends can never see geometrically different crops of the same frame. Must
+#              also exactly mirror the classification dataset builder's training-time
+#              preprocessing (resize-short-side + center-crop) -- NOT the letterboxing
+#              `onnx_yolo.preprocess` uses for the detection path.
 # Side Effects: None (pure function of its inputs).
-def preprocess_classify(image: np.ndarray, input_size: int) -> np.ndarray:
+def resize_and_center_crop(image: np.ndarray, input_size: int) -> np.ndarray:
     """Must exactly match the classification dataset builder's training-time
     resize-short-side + center-crop (not the detection path's letterboxing) --
-    diverging here silently skews every confidence the model produces."""
+    diverging here silently skews every confidence the model produces. Shared
+    by every inference backend (ONNX, Hailo) so they never diverge from each
+    other either."""
     orig_h, orig_w = image.shape[:2]
     short_side = min(orig_h, orig_w)
     scale = input_size / short_side
@@ -71,8 +76,26 @@ def preprocess_classify(image: np.ndarray, input_size: int) -> np.ndarray:
 
     top = (resized_h - input_size) // 2
     left = (resized_w - input_size) // 2
-    cropped = resized[top : top + input_size, left : left + input_size]
+    return resized[top : top + input_size, left : left + input_size]
 
+
+# np.ndarray preprocess_classify(np.ndarray image, int input_size)
+# Inputs: np.ndarray image - source BGR frame (HxWx3, uint8) to preprocess
+#         int input_size - target square spatial size the model expects
+# Outputs: np.ndarray - a (1, 3, input_size, input_size) float32 blob in [0, 1], RGB,
+#          channel-first
+# Description: Crops via `resize_and_center_crop`, then converts BGR->RGB and HWC->CHW, scales
+#              to [0, 1], and adds a batch dimension -- the ONNX Runtime backend's input
+#              contract (float32 NCHW). See `argus.detectors.hailo.preprocess_classify_hailo`
+#              for the Hailo HEF backend's contract (uint8 NHWC, no /255 scaling -- that
+#              normalization is instead baked into the compiled HEF), which shares this same
+#              crop via `resize_and_center_crop` but diverges from here on.
+# Side Effects: None (pure function of its inputs).
+def preprocess_classify(image: np.ndarray, input_size: int) -> np.ndarray:
+    """Must exactly match the classification dataset builder's training-time
+    resize-short-side + center-crop (not the detection path's letterboxing) --
+    diverging here silently skews every confidence the model produces."""
+    cropped = resize_and_center_crop(image, input_size)
     rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
     chw = rgb.transpose(2, 0, 1)
     blob = np.ascontiguousarray(chw, dtype=np.float32) / 255.0

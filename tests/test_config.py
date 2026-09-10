@@ -206,10 +206,10 @@ def test_detector_layout_invalid_value_rejected():
 
 
 def test_detector_kind_valid_values_accepted():
-    for value in ("detection", "classification"):
+    for value in ("detection", "classification", "hailo"):
         data = _base_dict()
         data["detector"]["kind"] = value
-        if value == "classification":
+        if value in ("classification", "hailo"):
             data["detector"]["class_names"] = ["normal", "spaghetti"]
         config = Config.from_dict(data)
         assert config.detector.kind == value
@@ -250,6 +250,25 @@ def test_classification_kind_with_class_names_accepted():
         "stringing",
         "warping",
     )
+
+
+def test_hailo_kind_requires_class_names():
+    data = _base_dict()
+    data["detector"]["kind"] = "hailo"
+    # class_names deliberately left unset -- a compiled HEF has no ONNX-metadata
+    # equivalent for HailoDetector to fall back on, so config is the only source
+    # of truth and this must fail loudly just like the classification kind does.
+    with pytest.raises(ConfigError):
+        Config.from_dict(data)
+
+
+def test_hailo_kind_with_class_names_accepted():
+    data = _base_dict()
+    data["detector"]["kind"] = "hailo"
+    data["detector"]["class_names"] = ["failure", "normal"]
+    config = Config.from_dict(data)
+    assert config.detector.kind == "hailo"
+    assert config.detector.class_names == ("failure", "normal")
 
 
 def test_detection_kind_does_not_require_class_names():

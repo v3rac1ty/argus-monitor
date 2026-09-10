@@ -23,6 +23,7 @@ from argus.config import Config, DetectorConfig, load_config
 from argus.decision import DecisionEngine
 from argus.detectors.base import Detector
 from argus.detectors.classifier import ClassifierDetector
+from argus.detectors.hailo import HailoDetector
 from argus.detectors.mock import MockDetector
 from argus.detectors.onnx_yolo import OnnxYoloDetector
 from argus.moonraker import MoonrakerClient
@@ -344,19 +345,23 @@ class ArgusService:
 # Detector build_detector(DetectorConfig cfg)
 # Inputs: DetectorConfig cfg - the detector configuration section (kind, model_path, providers,
 #                 input_size, class_names, thresholds, severity map, etc.)
-# Outputs: Detector - a `ClassifierDetector` when `cfg.kind == "classification"`, otherwise an
-#          `OnnxYoloDetector` (the default "detection" kind)
+# Outputs: Detector - a `ClassifierDetector` when `cfg.kind == "classification"`, a
+#          `HailoDetector` when `cfg.kind == "hailo"`, otherwise an `OnnxYoloDetector` (the
+#          default "detection" kind)
 # Description: Dispatches on `cfg.kind` -- already validated against `_VALID_DETECTOR_KINDS` in
 #              argus.config -- to construct the concrete `Detector` implementation that should
 #              actually run inference. Kept as a standalone function rather than inlined in
 #              `build_service` so the kind-to-class dispatch is unit-testable on its own, without
-#              constructing a whole service or requiring a real ONNX model file on disk.
-# Side Effects: Constructing either concrete detector reads `cfg.model_path` from disk (raising
-#               FileNotFoundError if missing) and allocates an onnxruntime InferenceSession --
-#               see ClassifierDetector.__init__ / OnnxYoloDetector.__init__ for specifics.
+#              constructing a whole service or requiring a real model file on disk.
+# Side Effects: Constructing any concrete detector reads `cfg.model_path` from disk (raising
+#               FileNotFoundError if missing); ClassifierDetector/OnnxYoloDetector allocate an
+#               onnxruntime InferenceSession, HailoDetector allocates HailoRT resources
+#               (VDevice/network group/vstreams) -- see each __init__ for specifics.
 def build_detector(cfg: DetectorConfig) -> Detector:
     if cfg.kind == "classification":
         return ClassifierDetector(cfg)
+    if cfg.kind == "hailo":
+        return HailoDetector(cfg)
     return OnnxYoloDetector(cfg)
 
 
@@ -376,8 +381,8 @@ def build_detector(cfg: DetectorConfig) -> Detector:
 # Description: Assembles the real FrameSource, Detector, DecisionEngine, MoonrakerClient,
 #              Notifier, and EventStore from `cfg` (honoring any overrides) and injects them into
 #              a new ArgusService. The detector is chosen by `build_detector(cfg.detector)` --
-#              `ClassifierDetector` or `OnnxYoloDetector` depending on `cfg.detector.kind` --
-#              unless `detector_override` is given, which always wins.
+#              `ClassifierDetector`, `HailoDetector`, or `OnnxYoloDetector` depending on
+#              `cfg.detector.kind` -- unless `detector_override` is given, which always wins.
 # Side Effects: Constructing the real collaborators may touch hardware/network/filesystem (e.g.
 #               build_detector loading a model file, MoonrakerClient/build_notifier creating
 #               HTTP sessions) -- see each collaborator's own __init__ for specifics.

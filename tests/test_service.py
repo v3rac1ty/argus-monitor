@@ -537,6 +537,33 @@ def test_build_detector_detection_kind_constructs_onnx_yolo_detector(monkeypatch
     assert calls == [cfg]
 
 
+def test_build_detector_hailo_kind_constructs_hailo_detector(monkeypatch):
+    sentinel = object()
+    calls: list[DetectorConfig] = []
+
+    def fake_hailo_detector(cfg: DetectorConfig) -> object:
+        calls.append(cfg)
+        return sentinel
+
+    monkeypatch.setattr(service_module, "HailoDetector", fake_hailo_detector)
+    monkeypatch.setattr(
+        service_module,
+        "ClassifierDetector",
+        lambda cfg: pytest.fail("ClassifierDetector must not be constructed for kind='hailo'"),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "OnnxYoloDetector",
+        lambda cfg: pytest.fail("OnnxYoloDetector must not be constructed for kind='hailo'"),
+    )
+
+    cfg = DetectorConfig(kind="hailo", class_names=("failure", "normal"))
+    result = service_module.build_detector(cfg)
+
+    assert result is sentinel
+    assert calls == [cfg]
+
+
 def test_build_service_detector_override_wins_over_kind_dispatch(monkeypatch):
     # Neither concrete constructor may be called: an explicit
     # detector_override must short-circuit build_detector entirely -- this

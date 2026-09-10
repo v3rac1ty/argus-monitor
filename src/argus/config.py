@@ -30,7 +30,13 @@ _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
 _VALID_DETECTOR_LAYOUTS = {"auto", "yolov8", "end2end"}
 
-_VALID_DETECTOR_KINDS = {"detection", "classification"}
+_VALID_DETECTOR_KINDS = {"detection", "classification", "hailo"}
+
+#: Kinds whose class order comes only from `cfg.class_names` -- unlike ONNX
+#: ("classification"), a compiled HEF carries no equivalent embedded
+#: metadata for `HailoDetector` to reconcile against, so config is the only
+#: source of truth and must be non-empty.
+_KINDS_REQUIRING_CLASS_NAMES = {"classification", "hailo"}
 
 
 class ConfigError(Exception):
@@ -56,12 +62,15 @@ class CameraConfig:
 
 @dataclass(frozen=True)
 class DetectorConfig:
-    """ONNX detector model, preprocessing, and per-class thresholds.
+    """ONNX/Hailo detector model, preprocessing, and per-class thresholds.
 
     `kind` selects `OnnxYoloDetector` ("detection", default; see `layout` for
-    YOLOv8 vs YOLO26 end2end) or `ClassifierDetector` ("classification").
-    `class_names` gives the model's output index order and is required
-    (non-empty) for `kind == "classification"`.
+    YOLOv8 vs YOLO26 end2end), `ClassifierDetector` ("classification", ONNX
+    Runtime), or `HailoDetector` ("hailo", a HEF compiled for the AI HAT+'s
+    Hailo-8 NPU). `class_names` gives the model's output index order and is
+    required (non-empty) for `kind in ("classification", "hailo")` -- a
+    compiled HEF carries no ONNX-metadata equivalent for `HailoDetector` to
+    fall back on, so config is the only source of truth there.
     """
 
     kind: str = "detection"
@@ -395,10 +404,10 @@ def _validate(config: Config) -> None:
         raise ConfigError(
             f"detector.kind must be one of {sorted(_VALID_DETECTOR_KINDS)}, got {det.kind!r}"
         )
-    if det.kind == "classification" and not det.class_names:
+    if det.kind in _KINDS_REQUIRING_CLASS_NAMES and not det.class_names:
         raise ConfigError(
-            "detector.class_names is required (and must be non-empty) when "
-            "detector.kind == 'classification'"
+            f"detector.class_names is required (and must be non-empty) when "
+            f"detector.kind == {det.kind!r}"
         )
     if det.layout not in _VALID_DETECTOR_LAYOUTS:
         raise ConfigError(

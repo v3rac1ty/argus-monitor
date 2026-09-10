@@ -1,11 +1,13 @@
 """Evaluates a trained classifier on ``--split`` (default test): overall accuracy and per-class P/R/F1, the confusion matrix, a binary normal-vs-defect collapse with false-positive rate, the real runtime ``p_failure`` threshold sweep for the catastrophic class (``--catastrophic-class``, default ``spaghetti``; the only class allowed to auto-pause a print), and a source-confound diagnostic splitting catastrophic-class recall by dataset origin (this dataset's ``normal`` is 100% Hugging Face while other defects are ~100% FDM; ``spaghetti`` is the one class mixed across both).
 
-Two inference backends are supported, selected automatically from ``--weights``' suffix (``select_backend``): an Ultralytics ``.pt`` checkpoint (the original 6-class model), or a ``.onnx`` export (e.g. the binary ``failure``/``normal`` model trained outside Ultralytics via tinygrad). The ONNX backend reuses the real production pre/post-processing from ``argus.detectors.classifier`` (``preprocess_classify``, ``probabilities_from_output``, ``class_names_from_onnx_metadata``) so train/eval/deploy can never silently diverge, and it fails loudly if the ONNX file carries no class-name metadata -- unlike ``ClassifierDetector`` this script has no ``DetectorConfig.class_names`` to fall back on. Reporting class order and the catastrophic-class index are both resolved from the model's own class names (``resolve_report_class_order``, ``resolve_catastrophic_class_index``), so the same code path handles the curated 6-class order and the binary model's ``("failure", "normal")`` order without assuming either.
+Three inference backends are supported, selected automatically from ``--weights``' suffix (``select_backend``): an Ultralytics ``.pt`` checkpoint (the original 6-class model), a ``.onnx`` export (e.g. the binary ``failure``/``normal`` model trained outside Ultralytics via tinygrad), or a Hailo ``.hef`` (the same binary model, quantized and compiled for the AI HAT+ -- see docs/hailo-deployment.md). The ONNX backend reuses the real production pre/post-processing from ``argus.detectors.classifier`` (``preprocess_classify``, ``probabilities_from_output``, ``class_names_from_onnx_metadata``) so train/eval/deploy can never silently diverge, and it fails loudly if the ONNX file carries no class-name metadata -- unlike ``ClassifierDetector`` this script has no ``DetectorConfig.class_names`` to fall back on. The Hailo backend reuses ``argus.detectors.hailo.HailoDetector.predict_proba`` the same way, for the same reason -- but a compiled HEF carries no class-name metadata AT ALL (not even the fallback-worthy kind ONNX has), so ``--class-names`` is REQUIRED for it. Reporting class order and the catastrophic-class index are both resolved from the model's own class names (``resolve_report_class_order``, ``resolve_catastrophic_class_index``), so the same code path handles the curated 6-class order and the binary model's ``("failure", "normal")`` order without assuming either.
 
 ``--min-recall`` rejects the vacuous "precision=1.0 at ~zero recall" convention: a threshold so high the model almost never fires trivially has no false positives and no real value. Ultralytics assigns class indices alphabetically, not the human-readable order used for reporting here -- a mismatch is flagged loudly since ``ClassifierDetector`` trusts ``cfg.class_names`` to match the model's real order.
 
 Usage: python training/evaluate_classifier.py --weights <best.pt> [--split test] [--target-precision 0.95]
        python training/evaluate_classifier.py --weights <model.onnx> --imgsz 320 --catastrophic-class failure
+       python training/evaluate_classifier.py --weights models/argus_bin.hef --imgsz 320 \\
+           --catastrophic-class failure --class-names failure,normal
 """
 
 from __future__ import annotations
@@ -380,16 +382,22 @@ def list_split_images(data_dir: Path, split: str, class_names: Sequence[str]) ->
 
 
 # str select_backend(Path weights)
-# Inputs: Path weights - path to the trained checkpoint (Ultralytics ``best.pt`` or an ONNX
-#         export)
-# Outputs: str - "onnx" if weights has a ".onnx" suffix (case-insensitive), else "ultralytics"
+# Inputs: Path weights - path to the trained checkpoint (Ultralytics ``best.pt``, an ONNX
+#         export, or a compiled Hailo ``.hef``)
+# Outputs: str - "onnx" for a ".onnx" suffix, "hailo" for a ".hef" suffix (both
+#          case-insensitive), else "ultralytics"
 # Description: Picks which inference backend main() should use, purely from the weights file's
-#              suffix -- the tinygrad-trained binary model is only ever available as ONNX (no
-#              Ultralytics checkpoint exists for it), while the original 6-class model is a
-#              ``.pt`` Ultralytics checkpoint.
+#              suffix -- the tinygrad-trained binary model is only ever available as ONNX or a
+#              HEF compiled from it (no Ultralytics checkpoint exists for it), while the
+#              original 6-class model is a ``.pt`` Ultralytics checkpoint.
 # Side Effects: None (pure function of its input; does not touch the filesystem)
 def select_backend(weights: Path) -> str:
-    return "onnx" if Path(weights).suffix.lower() == ".onnx" else "ultralytics"
+    suffix = Path(weights).suffix.lower()
+    if suffix == ".onnx":
+        return "onnx"
+    if suffix == ".hef":
+        return "hailo"
+    return "ultralytics"
 
 
 # tuple[np.ndarray, dict[int, str]] run_inference(Path weights, Sequence[Path] image_paths, int imgsz, int batch, str device)
@@ -519,6 +527,72 @@ def run_inference_onnx(onnx_path: Path, image_paths: Sequence[Path], imgsz: int)
         blob = preprocess_classify(image, effective_imgsz)
         raw = session.run(None, {input_meta.name: blob})[0]
         probs[i, :] = np.asarray(probabilities_from_output(raw)).reshape(-1)
+    return probs, names_by_idx
+
+
+# tuple[np.ndarray, dict[int, str]] run_inference_hailo(Path hef_path, Sequence[Path] image_paths, int imgsz, Sequence[str] class_names)
+# Inputs: Path hef_path - path to the compiled Hailo HEF (see docs/hailo-deployment.md)
+#         Sequence[Path] image_paths - images to classify
+#         int imgsz - input image size the HEF was compiled for; unlike run_inference_onnx there
+#         is no model-declared static shape to prefer here, so this value is always authoritative
+#         -- get it wrong and every image is cropped to the wrong size with no error raised
+#         Sequence[str] class_names - class names in the model's real training-time output-index
+#         order (from --class-names on the CLI -- a compiled HEF has no embedded metadata
+#         equivalent to ONNX's custom_metadata_map for this script to fall back on)
+# Outputs: tuple[np.ndarray, dict[int, str]] - (probs, names): probs is a
+#          (len(image_paths), num_classes) float64 array (rows in the same order as
+#          image_paths); names is dict(enumerate(class_names)) -- the SAME shape of result
+#          run_inference/run_inference_onnx return, so build_report and every downstream metric
+#          function are backend-agnostic
+# Description: Runs the compiled HEF over image_paths through
+#              argus.detectors.hailo.HailoDetector's own HailoRT plumbing (its predict_proba
+#              method), batch size 1 in a loop -- same as run_inference_onnx. Reuses the real
+#              production preprocessing (preprocess_classify_hailo, via predict_proba) and
+#              probability normalization (probabilities_from_output, also via predict_proba) so
+#              this evaluation can never silently diverge from what actually runs on the Pi. A
+#              HailoDetector is constructed with default_threshold=0.0 and empty
+#              class_thresholds/severity purely as plumbing to reach predict_proba -- this
+#              function never calls postprocess_classify, so none of that threshold/severity
+#              configuration is actually exercised.
+# Side Effects: Imports cv2, argus.config, argus.detectors.hailo, and argus.types lazily.
+#               Constructs a HailoDetector (allocating real HailoRT resources -- VDevice, network
+#               group, vstreams; requires hailo_platform installed and a Hailo device attached,
+#               i.e. this only runs on the Pi with the AI HAT+, never on this project's macOS dev
+#               machine) and closes it in a finally block. Reads each image file from disk via
+#               cv2.imread; runs one Hailo-8 inference pass per image. Raises IOError if an image
+#               fails to load.
+def run_inference_hailo(
+    hef_path: Path, image_paths: Sequence[Path], imgsz: int, class_names: Sequence[str]
+) -> tuple[np.ndarray, dict[int, str]]:
+    import cv2
+
+    from argus.config import DetectorConfig
+    from argus.detectors.hailo import HailoDetector
+
+    print(f"[evaluate_classifier] Hailo backend: using input size {imgsz} (--imgsz; no model-declared shape to prefer)")
+
+    cfg = DetectorConfig(
+        kind="hailo",
+        model_path=str(hef_path),
+        input_size=imgsz,
+        class_names=tuple(class_names),
+        default_threshold=0.0,
+        class_thresholds={},
+        severity={},
+    )
+    detector = HailoDetector(cfg)
+    try:
+        num_classes = len(class_names)
+        probs = np.zeros((len(image_paths), num_classes), dtype=np.float64)
+        for i, path in enumerate(image_paths):
+            image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if image is None:
+                raise IOError(f"Failed to read image: {path}")
+            probs[i, :] = detector.predict_proba(image)
+    finally:
+        detector.close()
+
+    names_by_idx: dict[int, str] = dict(enumerate(class_names))
     return probs, names_by_idx
 
 
@@ -1041,7 +1115,7 @@ def print_report(report: dict[str, object]) -> None:
 #               filesystem or network activity)
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS, help=f"Path to trained best.pt or exported .onnx (default: {DEFAULT_WEIGHTS}); backend is auto-selected from the suffix (select_backend)")
+    parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS, help=f"Path to trained best.pt, exported .onnx, or a compiled Hailo .hef (default: {DEFAULT_WEIGHTS}); backend is auto-selected from the suffix (select_backend)")
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA_DIR, help=f"Classification dataset root (default: {DEFAULT_DATA_DIR})")
     parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"], help="Which split to evaluate (default: test)")
     parser.add_argument(
@@ -1050,16 +1124,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=512,
         help=(
             "Input image size (default: 512, matching the 6-class Ultralytics model; the binary "
-            "ONNX model is trained at 320 -- pass --imgsz 320 for it). For the ONNX backend this is "
-            "only a FALLBACK: run_inference_onnx prefers the model's own static input shape baked "
-            "into the ONNX graph (exactly like argus.detectors.classifier.ClassifierDetector does at "
-            "runtime) whenever the graph declares one, and only falls back to this value if the "
-            "graph's input shape is dynamic. The Ultralytics (.pt) backend always uses this value "
-            "directly -- it has no model-declared shape to prefer."
+            "ONNX/HEF model is trained at 320 -- pass --imgsz 320 for it). For the ONNX backend "
+            "this is only a FALLBACK: run_inference_onnx prefers the model's own static input "
+            "shape baked into the ONNX graph (exactly like "
+            "argus.detectors.classifier.ClassifierDetector does at runtime) whenever the graph "
+            "declares one, and only falls back to this value if the graph's input shape is "
+            "dynamic. The Ultralytics (.pt) and Hailo (.hef) backends always use this value "
+            "directly -- neither has a model-declared shape this script knows how to read, so "
+            "getting it wrong silently crops every image to the wrong size."
         ),
     )
-    parser.add_argument("--batch", type=int, default=32, help="Batch size for the Ultralytics (.pt) backend (default: 32). The ONNX backend always runs batch size 1 in a loop.")
-    parser.add_argument("--device", type=str, default="0", help="CUDA device for the Ultralytics (.pt) backend (default: 0). Unused by the ONNX backend, which always uses CPUExecutionProvider.")
+    parser.add_argument("--batch", type=int, default=32, help="Batch size for the Ultralytics (.pt) backend (default: 32). The ONNX and Hailo backends always run batch size 1 in a loop.")
+    parser.add_argument("--device", type=str, default="0", help="CUDA device for the Ultralytics (.pt) backend (default: 0). Unused by the ONNX/Hailo backends.")
+    parser.add_argument(
+        "--class-names",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated class names in the model's real training-time output-index order "
+            "(e.g. 'failure,normal'). REQUIRED for the Hailo (.hef) backend -- a compiled HEF "
+            "carries no embedded class-name metadata for this script to fall back on, unlike the "
+            "ONNX backend's custom_metadata_map (class_names_from_onnx_metadata). Ignored by the "
+            "ONNX and Ultralytics backends, which always resolve class names from the model "
+            "itself."
+        ),
+    )
     parser.add_argument(
         "--catastrophic-class",
         type=str,
@@ -1145,6 +1234,17 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[evaluate_classifier] Running inference ({backend} backend) on {len(paths)} images with '{args.weights}' ...")
     if backend == "onnx":
         probs, names_by_idx = run_inference_onnx(args.weights, paths, args.imgsz)
+    elif backend == "hailo":
+        if not args.class_names:
+            raise ValueError(
+                "--class-names is required when evaluating a Hailo .hef file -- a compiled HEF "
+                "carries no embedded class-name metadata for this script to fall back on (unlike "
+                "the ONNX backend's custom_metadata_map). Pass e.g. --class-names failure,normal "
+                "in the model's real training-time output order (the same order used when the "
+                "model was exported to ONNX, before HEF compilation)."
+            )
+        class_names = tuple(name.strip() for name in args.class_names.split(","))
+        probs, names_by_idx = run_inference_hailo(args.weights, paths, args.imgsz, class_names)
     else:
         probs, names_by_idx = run_inference(args.weights, paths, args.imgsz, args.batch, args.device)
 
