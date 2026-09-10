@@ -29,9 +29,10 @@ from typing import Optional, Sequence
 
 import cv2
 
-from argus.config import Config, DecisionConfig, load_config
+from argus.config import Config, DecisionConfig, DetectorConfig, load_config
 from argus.decision import DecisionEngine
 from argus.detectors.base import Detector
+from argus.detectors.classifier import ClassifierDetector
 from argus.detectors.mock import MockDetector
 from argus.detectors.onnx_yolo import OnnxYoloDetector
 from argus.quality import evaluate_frame
@@ -636,6 +637,26 @@ def _build_decision_cfg(cfg: Config, args: argparse.Namespace) -> DecisionConfig
     return dataclasses.replace(cfg.decision, **overrides)
 
 
+# Detector _build_detector(DetectorConfig cfg)
+# Inputs: DetectorConfig cfg - the detector configuration section (kind, model_path, providers,
+#                 input_size, class_names, thresholds, severity map, etc.)
+# Outputs: Detector - a `ClassifierDetector` when `cfg.kind == "classification"`, otherwise an
+#          `OnnxYoloDetector` (the default "detection" kind)
+# Description: Dispatches on `cfg.kind` -- already validated against `_VALID_DETECTOR_KINDS` in
+#              argus.config -- to construct the concrete `Detector` implementation to replay
+#              calibration through, mirroring `argus.service.build_detector` so a calibration
+#              run always measures the false-positive rate of the detector that will actually
+#              ship. Duplicated rather than imported from argus.service so this tool script stays
+#              free of that module's heavier import-time dependencies (camera/moonraker/notify).
+# Side Effects: Constructing either concrete detector reads `cfg.model_path` from disk (raising
+#               FileNotFoundError if missing) and allocates an onnxruntime InferenceSession --
+#               see ClassifierDetector.__init__ / OnnxYoloDetector.__init__ for specifics.
+def _build_detector(cfg: DetectorConfig) -> Detector:
+    if cfg.kind == "classification":
+        return ClassifierDetector(cfg)
+    return OnnxYoloDetector(cfg)
+
+
 # None main(Optional[list[str]] argv=None)
 # Inputs: Optional[list[str]] argv - command-line arguments to parse; defaults to None (reads
 #                                    sys.argv)
@@ -672,7 +693,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         if args.scores_out is not None and len(args.frames) != 1:
             raise SystemExit("--scores-out requires exactly one --frames directory")
 
-        detector: Detector = MockDetector([0.0], cycle=True) if args.mock else OnnxYoloDetector(cfg.detector)
+        detector: Detector = MockDetector([0.0], cycle=True) if args.mock else _build_detector(cfg.detector)
         try:
             for directory in args.frames:
                 records = compute_scores_from_frames(directory, detector, cfg, tick_interval_s)

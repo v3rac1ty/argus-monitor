@@ -1,8 +1,11 @@
-"""Evaluates a trained 6-class classifier on ``--split`` (default test): overall accuracy and per-class P/R/F1, the confusion matrix, a binary normal-vs-defect collapse with false-positive rate, the real runtime ``p_failure`` threshold sweep for ``spaghetti`` (the only class allowed to auto-pause a print), and a source-confound diagnostic splitting spaghetti recall by dataset origin (this dataset's ``normal`` is 100% Hugging Face while other defects are ~100% FDM; ``spaghetti`` is the one class mixed across both).
+"""Evaluates a trained classifier on ``--split`` (default test): overall accuracy and per-class P/R/F1, the confusion matrix, a binary normal-vs-defect collapse with false-positive rate, the real runtime ``p_failure`` threshold sweep for the catastrophic class (``--catastrophic-class``, default ``spaghetti``; the only class allowed to auto-pause a print), and a source-confound diagnostic splitting catastrophic-class recall by dataset origin (this dataset's ``normal`` is 100% Hugging Face while other defects are ~100% FDM; ``spaghetti`` is the one class mixed across both).
+
+Two inference backends are supported, selected automatically from ``--weights``' suffix (``select_backend``): an Ultralytics ``.pt`` checkpoint (the original 6-class model), or a ``.onnx`` export (e.g. the binary ``failure``/``normal`` model trained outside Ultralytics via tinygrad). The ONNX backend reuses the real production pre/post-processing from ``argus.detectors.classifier`` (``preprocess_classify``, ``probabilities_from_output``, ``class_names_from_onnx_metadata``) so train/eval/deploy can never silently diverge, and it fails loudly if the ONNX file carries no class-name metadata -- unlike ``ClassifierDetector`` this script has no ``DetectorConfig.class_names`` to fall back on. Reporting class order and the catastrophic-class index are both resolved from the model's own class names (``resolve_report_class_order``, ``resolve_catastrophic_class_index``), so the same code path handles the curated 6-class order and the binary model's ``("failure", "normal")`` order without assuming either.
 
 ``--min-recall`` rejects the vacuous "precision=1.0 at ~zero recall" convention: a threshold so high the model almost never fires trivially has no false positives and no real value. Ultralytics assigns class indices alphabetically, not the human-readable order used for reporting here -- a mismatch is flagged loudly since ``ClassifierDetector`` trusts ``cfg.class_names`` to match the model's real order.
 
 Usage: python training/evaluate_classifier.py --weights <best.pt> [--split test] [--target-precision 0.95]
+       python training/evaluate_classifier.py --weights <model.onnx> --imgsz 320 --catastrophic-class failure
 """
 
 from __future__ import annotations
@@ -376,6 +379,19 @@ def list_split_images(data_dir: Path, split: str, class_names: Sequence[str]) ->
     return records
 
 
+# str select_backend(Path weights)
+# Inputs: Path weights - path to the trained checkpoint (Ultralytics ``best.pt`` or an ONNX
+#         export)
+# Outputs: str - "onnx" if weights has a ".onnx" suffix (case-insensitive), else "ultralytics"
+# Description: Picks which inference backend main() should use, purely from the weights file's
+#              suffix -- the tinygrad-trained binary model is only ever available as ONNX (no
+#              Ultralytics checkpoint exists for it), while the original 6-class model is a
+#              ``.pt`` Ultralytics checkpoint.
+# Side Effects: None (pure function of its input; does not touch the filesystem)
+def select_backend(weights: Path) -> str:
+    return "onnx" if Path(weights).suffix.lower() == ".onnx" else "ultralytics"
+
+
 # tuple[np.ndarray, dict[int, str]] run_inference(Path weights, Sequence[Path] image_paths, int imgsz, int batch, str device)
 # Inputs: Path weights - path to the trained classification best.pt checkpoint
 #         Sequence[Path] image_paths - images to classify
@@ -413,6 +429,97 @@ def run_inference(
         row = row.cpu().numpy() if hasattr(row, "cpu") else np.asarray(row)
         probs[i, :] = row
     return probs, names
+
+
+# Optional[int] _static_input_size(Optional[Sequence[object]] shape)
+# Inputs: Optional[Sequence[object]] shape - the ONNX-declared input shape (e.g. from
+#         session.get_inputs()[0].shape), possibly containing symbolic/dynamic dims
+# Outputs: Optional[int] - the static square spatial size (e.g. 320), or None if the shape is
+#          missing, not 4D, dynamic, or non-square
+# Description: Extracts a usable static input size from a declared ONNX input shape, so
+#              run_inference_onnx can prefer the model's own baked-in size over --imgsz, exactly
+#              like argus.detectors.classifier.ClassifierDetector does for the real runtime path.
+#              Duplicated from argus.detectors.classifier._static_input_size rather than imported
+#              -- that helper is private to that module (itself duplicated from
+#              onnx_yolo._static_input_size for the same reason), and this evaluation script
+#              stays free of any dependency on another module's private helpers.
+# Side Effects: None (pure function of its input).
+def _static_input_size(shape: Optional[Sequence[object]]) -> Optional[int]:
+    if shape is None or len(shape) != 4:
+        return None
+    h, w = shape[2], shape[3]
+    if isinstance(h, int) and isinstance(w, int) and h > 0 and h == w:
+        return h
+    return None
+
+
+# tuple[np.ndarray, dict[int, str]] run_inference_onnx(Path onnx_path, Sequence[Path] image_paths, int imgsz)
+# Inputs: Path onnx_path - path to the exported classifier ONNX model
+#         Sequence[Path] image_paths - images to classify
+#         int imgsz - FALLBACK input image size, used only when the ONNX graph itself declares a
+#         dynamic (non-static) input shape; when the graph declares a static square shape (as
+#         both the 6-class and binary exports do), that shape wins -- see _static_input_size and
+#         argus.detectors.classifier.ClassifierDetector's identical precedence
+# Outputs: tuple[np.ndarray, dict[int, str]] - (probs, names): probs is a
+#          (len(image_paths), num_classes) float64 array (rows in the same order as
+#          image_paths); names is the model's own {index: class_name} mapping, read from the
+#          ONNX file's own metadata (the model's real output-index order that probs' columns are
+#          indexed by) -- the SAME shape of result run_inference returns, so build_report and
+#          every downstream metric function are backend-agnostic
+# Description: Runs the exported ONNX classifier over image_paths, batch size 1 in a loop (test
+#              splits here are a few hundred images, not worth batching). Reuses the real
+#              production pre/post-processing from argus.detectors.classifier --
+#              preprocess_classify for the exact resize-short-side + center-crop the printer runs
+#              at inference time, and probabilities_from_output for the same raw-logits-vs
+#              -already-softmaxed auto-detection production uses -- so train/eval/deploy can
+#              never silently diverge by reimplementing either step here. Class names come from
+#              class_names_from_onnx_metadata; unlike ClassifierDetector this script has no
+#              DetectorConfig.class_names to fall back on, so missing/unparseable metadata is a
+#              hard error rather than a guess.
+# Side Effects: Imports onnxruntime and cv2 lazily; constructs an onnxruntime.InferenceSession
+#               (CPUExecutionProvider) and reads each image file from disk via cv2.imread; runs
+#               one inference pass per image. Raises ValueError if the ONNX file carries no
+#               parseable class-name metadata. Raises IOError if an image fails to load.
+def run_inference_onnx(onnx_path: Path, image_paths: Sequence[Path], imgsz: int) -> tuple[np.ndarray, dict[int, str]]:
+    import cv2
+    import onnxruntime as ort
+
+    from argus.detectors.classifier import (
+        class_names_from_onnx_metadata,
+        preprocess_classify,
+        probabilities_from_output,
+    )
+
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+
+    class_names = class_names_from_onnx_metadata(session)
+    if class_names is None:
+        raise ValueError(
+            f"ONNX model at '{onnx_path}' has no parseable class-name metadata (missing or "
+            "unparseable 'names' entry in custom_metadata_map). Unlike "
+            "argus.detectors.classifier.ClassifierDetector, this evaluation script has no "
+            "DetectorConfig.class_names to fall back on -- guessing an index order here would "
+            "silently produce a confidently wrong report. Re-export the model (see "
+            "training/export_classifier_onnx.py) so it embeds its own class-name metadata."
+        )
+    names_by_idx: dict[int, str] = dict(enumerate(class_names))
+
+    input_meta = session.get_inputs()[0]
+    static_size = _static_input_size(input_meta.shape)
+    effective_imgsz = static_size if static_size is not None else imgsz
+    size_source = "the model's own static input shape" if static_size is not None else "--imgsz (model shape is dynamic)"
+    print(f"[evaluate_classifier] ONNX backend: using input size {effective_imgsz} ({size_source})")
+
+    num_classes = len(class_names)
+    probs = np.zeros((len(image_paths), num_classes), dtype=np.float64)
+    for i, path in enumerate(image_paths):
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise IOError(f"Failed to read image: {path}")
+        blob = preprocess_classify(image, effective_imgsz)
+        raw = session.run(None, {input_meta.name: blob})[0]
+        probs[i, :] = np.asarray(probabilities_from_output(raw)).reshape(-1)
+    return probs, names_by_idx
 
 
 # --------------------------------------------------------------------------
@@ -453,6 +560,46 @@ def check_class_order_matches_model(names_by_idx: Mapping[int, str], report_orde
     )
 
 
+# tuple[str, ...] resolve_report_class_order(Mapping[int, str] names_by_idx)
+# Inputs: Mapping[int, str] names_by_idx - the model's own {index: class_name} mapping
+# Outputs: tuple[str, ...] - the class order to use for this report's confusion matrix and
+#          per-class table
+# Description: Uses the curated human-readable REPORT_CLASS_ORDER when the model's classes are
+#              exactly the known 6-class set (regardless of the model's real index order) --
+#              preserving existing behaviour and check_class_order_matches_model's
+#              alphabetical-vs-human-order warning for that model. For any other class set (e.g.
+#              the binary failure/normal model trained outside Ultralytics), there is no curated
+#              human order to assume, so this falls back to the model's own real index order.
+# Side Effects: None
+def resolve_report_class_order(names_by_idx: Mapping[int, str]) -> tuple[str, ...]:
+    model_order = tuple(names_by_idx[i] for i in sorted(names_by_idx))
+    if set(model_order) == set(REPORT_CLASS_ORDER):
+        return REPORT_CLASS_ORDER
+    return model_order
+
+
+# int resolve_catastrophic_class_index(Mapping[int, str] names_by_idx, str catastrophic_class_name)
+# Inputs: Mapping[int, str] names_by_idx - the model's own {index: class_name} mapping
+#         str catastrophic_class_name - the class name to treat as catastrophic, from
+#         --catastrophic-class (default CATASTROPHIC_CLASS_NAME, "spaghetti")
+# Outputs: int - the model's output index for catastrophic_class_name
+# Description: Resolves --catastrophic-class against the model's actual class names, so a typo
+#              or a class the model doesn't have at all (e.g. running --catastrophic-class
+#              spaghetti against the binary failure/normal model) fails loudly with the model's
+#              real classes listed, rather than raising an opaque KeyError deep inside
+#              build_report.
+# Side Effects: Raises ValueError if catastrophic_class_name isn't one of the model's classes.
+def resolve_catastrophic_class_index(names_by_idx: Mapping[int, str], catastrophic_class_name: str) -> int:
+    idx_by_name = {name: i for i, name in names_by_idx.items()}
+    if catastrophic_class_name not in idx_by_name:
+        raise ValueError(
+            f"--catastrophic-class '{catastrophic_class_name}' is not one of this model's classes: "
+            f"{sorted(idx_by_name)}. Pass --catastrophic-class with one of those names (e.g. "
+            "'failure' for the binary failure/normal model, or 'spaghetti' for the 6-class model)."
+        )
+    return idx_by_name[catastrophic_class_name]
+
+
 # dict[str, object] build_report(Sequence[str] y_true, np.ndarray probs, Mapping[int, str] names_by_idx, Sequence[str] sources, argparse.Namespace args)
 # Inputs: Sequence[str] y_true - true class name per test image
 #         np.ndarray probs - (num_images, num_classes) probability array from run_inference,
@@ -468,10 +615,13 @@ def check_class_order_matches_model(names_by_idx: Mapping[int, str], report_orde
 #          a human-readable interpretation
 # Description: Orchestrates all five analyses described in the module docstring (overall
 #              accuracy/per-class metrics, confusion matrix, binary normal-vs-defect collapse,
-#              the real runtime catastrophic-path threshold sweep for "spaghetti", and the
-#              source-confound diagnostic splitting spaghetti recall by dataset origin) into one
-#              JSON-serializable report, then appends a human-readable interpretation via
-#              build_interpretation.
+#              the real runtime catastrophic-path threshold sweep for args.catastrophic_class,
+#              and the source-confound diagnostic splitting that class's recall by dataset
+#              origin) into one JSON-serializable report, then appends a human-readable
+#              interpretation via build_interpretation. The reporting class order is resolved
+#              from the model's own class names (resolve_report_class_order) rather than assumed
+#              to be the 6-class REPORT_CLASS_ORDER, so this works unchanged for the binary
+#              failure/normal model.
 # Side Effects: None (pure computation over already-computed inference results; no I/O)
 def build_report(
     y_true: Sequence[str],
@@ -480,24 +630,25 @@ def build_report(
     sources: Sequence[str],
     args: argparse.Namespace,
 ) -> dict[str, object]:
-    idx_by_name = {name: i for i, name in names_by_idx.items()}
     argmax_idx = probs.argmax(axis=1)
     y_pred = [names_by_idx[int(i)] for i in argmax_idx]
 
-    class_order_warning = check_class_order_matches_model(names_by_idx, REPORT_CLASS_ORDER)
+    report_class_order = resolve_report_class_order(names_by_idx)
+    class_order_warning = check_class_order_matches_model(names_by_idx, report_class_order)
 
     # -- 1 & 2: overall accuracy, per-class P/R/F1, full confusion matrix --
-    cm = build_confusion_matrix(y_true, y_pred, REPORT_CLASS_ORDER)
+    cm = build_confusion_matrix(y_true, y_pred, report_class_order)
     overall_accuracy = top1_accuracy(cm)
-    per_class = per_class_prf1(cm, REPORT_CLASS_ORDER)
+    per_class = per_class_prf1(cm, report_class_order)
 
     # -- 3: binary normal-vs-defect collapse --
     y_true_bin = binary_labels(y_true)
     y_pred_bin = binary_labels(y_pred)
     binary = binary_metrics(y_true_bin, y_pred_bin)
 
-    # -- 4: catastrophic-path (spaghetti) threshold sweep --
-    cat_idx = idx_by_name[CATASTROPHIC_CLASS_NAME]
+    # -- 4: catastrophic-path threshold sweep (args.catastrophic_class, default "spaghetti") --
+    catastrophic_class_name = args.catastrophic_class
+    cat_idx = resolve_catastrophic_class_index(names_by_idx, catastrophic_class_name)
     records = [
         CatastrophicRecord(
             true_name=t,
@@ -507,12 +658,12 @@ def build_report(
         for i, (t, a) in enumerate(zip(y_true, argmax_idx))
     ]
     thresholds = sweep_thresholds(args.sweep_start, args.sweep_end, args.sweep_step)
-    sweep = sweep_catastrophic(records, thresholds)
+    sweep = sweep_catastrophic(records, thresholds, catastrophic_class_name)
     target_result, vacuous_example = find_lowest_threshold_for_precision(sweep, args.target_precision, args.min_recall)
     best_point = best_supported_point(sweep, args.min_recall)
 
     p_failure_report = {
-        "catastrophic_class": CATASTROPHIC_CLASS_NAME,
+        "catastrophic_class": catastrophic_class_name,
         "target_precision": args.target_precision,
         "min_recall": args.min_recall,
         "confidence_sweep": sweep,
@@ -523,10 +674,10 @@ def build_report(
     }
 
     # -- 5: SOURCE-CONFOUND DIAGNOSTIC --
-    spaghetti_mask = [t == CATASTROPHIC_CLASS_NAME for t in y_true]
-    spaghetti_sources = [s for s, m in zip(sources, spaghetti_mask) if m]
-    spaghetti_correct = [p == CATASTROPHIC_CLASS_NAME for p, m in zip(y_pred, spaghetti_mask) if m]
-    by_source = group_recall_by_source(spaghetti_sources, spaghetti_correct)
+    catastrophic_mask = [t == catastrophic_class_name for t in y_true]
+    catastrophic_sources = [s for s, m in zip(sources, catastrophic_mask) if m]
+    catastrophic_correct = [p == catastrophic_class_name for p, m in zip(y_pred, catastrophic_mask) if m]
+    by_source = group_recall_by_source(catastrophic_sources, catastrophic_correct)
     unknown_count = by_source.get("unknown", {}).get("support", 0)
 
     fdm_entry = by_source.get("fdm")
@@ -544,7 +695,7 @@ def build_report(
         "by_source": by_source,
         "unknown_provenance_count": int(unknown_count),
         "recall_gap": recall_gap,
-        "conclusion": _source_confound_conclusion(fdm_entry, argus_entry, recall_gap, unknown_count),
+        "conclusion": _source_confound_conclusion(by_source, fdm_entry, argus_entry, recall_gap, unknown_count),
     }
 
     report: dict[str, object] = {
@@ -553,7 +704,7 @@ def build_report(
         "split": args.split,
         "num_images": len(y_true),
         "model_class_order": [names_by_idx[i] for i in sorted(names_by_idx)],
-        "report_class_order": list(REPORT_CLASS_ORDER),
+        "report_class_order": list(report_class_order),
         "class_order_warning": class_order_warning,
         "overall": {
             "top1_accuracy": overall_accuracy,
@@ -561,7 +712,7 @@ def build_report(
             "num_total": int(cm.sum()),
         },
         "per_class": per_class,
-        "confusion_matrix": {"labels": list(REPORT_CLASS_ORDER), "matrix": cm.tolist()},
+        "confusion_matrix": {"labels": list(report_class_order), "matrix": cm.tolist()},
         "binary_normal_vs_defect": binary,
         "p_failure_catastrophic": p_failure_report,
         "source_confound": source_confound,
@@ -570,48 +721,74 @@ def build_report(
     return report
 
 
-# str _source_confound_conclusion(Optional[dict[str, object]] fdm_entry, Optional[dict[str, object]] argus_entry, Optional[float] recall_gap, int unknown_count)
-# Inputs: Optional[dict[str, object]] fdm_entry - group_recall_by_source's "fdm" entry, or None
-#         if no FDM-sourced spaghetti test images were found
+# str _source_confound_conclusion(Mapping[str, dict[str, object]] by_source, Optional[dict[str, object]] fdm_entry, Optional[dict[str, object]] argus_entry, Optional[float] recall_gap, int unknown_count)
+# Inputs: Mapping[str, dict[str, object]] by_source - group_recall_by_source's full result, used
+#         only to detect the degenerate single-source (or zero-source) case
+#         Optional[dict[str, object]] fdm_entry - group_recall_by_source's "fdm" entry, or None
+#         if no FDM-sourced catastrophic-class test images were found
 #         Optional[dict[str, object]] argus_entry - group_recall_by_source's "argus_v2" entry,
-#         or None if no argus_v2-sourced spaghetti test images were found
+#         or None if no argus_v2-sourced catastrophic-class test images were found
 #         Optional[float] recall_gap - |FDM recall - argus_v2 recall|, or None if undefined
-#         int unknown_count - number of spaghetti test images with unrecoverable provenance
-# Outputs: str - a human-readable verdict on whether the recall gap indicates the model is
-#          keying on dataset origin rather than the spaghetti defect itself (LARGE/MODERATE/
-#          SMALL gap, or inconclusive if either source has no data)
-# Description: Interprets the FDM-vs-argus_v2 spaghetti recall gap for the SOURCE-CONFOUND
-#              DIAGNOSTIC (analysis 5), classifying the gap size and explaining what it does and
-#              doesn't prove about the model's reliance on lighting/framing/compression cues
-#              versus the actual defect.
+#         int unknown_count - number of catastrophic-class test images with unrecoverable
+#         provenance
+# Outputs: str - a human-readable verdict: "not applicable" if every catastrophic-class test
+#          image resolves to a single source (e.g. the binary model's single-Hugging-Face-source
+#          dataset), otherwise the FDM-vs-argus_v2 gap classification (LARGE/MODERATE/SMALL, or
+#          inconclusive if either of those two specific sources has no data)
+# Description: Interprets the SOURCE-CONFOUND DIAGNOSTIC (analysis 5) result. When by_source has
+#              at most one entry (all catastrophic-class test images share one provenance, or
+#              there are none at all), a cross-source comparison is degenerate by construction --
+#              this returns a "not applicable" verdict rather than falling through to the
+#              FDM-vs-argus_v2 language, which would misleadingly imply those two specific
+#              sources were expected. Otherwise classifies the FDM-vs-argus_v2 gap size and
+#              explains what it does and doesn't prove about the model's reliance on
+#              lighting/framing/compression cues versus the actual defect.
 # Side Effects: None (pure string formatting)
 def _source_confound_conclusion(
+    by_source: Mapping[str, dict[str, object]],
     fdm_entry: Optional[dict[str, object]],
     argus_entry: Optional[dict[str, object]],
     recall_gap: Optional[float],
     unknown_count: int,
 ) -> str:
+    if len(by_source) <= 1:
+        if by_source:
+            (only_source,) = by_source.keys()
+            source_desc = f"a single source ('{only_source}')"
+        else:
+            source_desc = "no source at all (zero catastrophic-class test images)"
+        return (
+            "Cross-source comparison is NOT APPLICABLE: every catastrophic-class test image "
+            f"resolves to {source_desc}, so there is no second source to compare recall against. "
+            "This is expected for a single-source dataset (e.g. the binary failure/normal model's "
+            "dataset, which is entirely from one Hugging Face source) and is not itself evidence "
+            "for or against a source confound -- it simply means this particular diagnostic has "
+            "nothing to compare here."
+        )
     if fdm_entry is None or argus_entry is None:
         return (
-            "Could not compute a per-source recall split -- spaghetti test images from one or both "
-            "sources (fdm, argus_v2) were not found. Provenance-based diagnosis is inconclusive."
+            "Could not compute a per-source recall split -- catastrophic-class test images from one "
+            "or both sources (fdm, argus_v2) were not found. Provenance-based diagnosis is "
+            "inconclusive."
         )
     if recall_gap is None:
-        return "One source had zero spaghetti test images; recall gap is undefined."
+        return "One source had zero catastrophic-class test images; recall gap is undefined."
 
     fdm_recall = fdm_entry["recall"]
     argus_recall = argus_entry["recall"]
     fdm_n = fdm_entry["support"]
     argus_n = argus_entry["support"]
-    unknown_note = f" ({unknown_count} spaghetti test image(s) had unrecoverable provenance.)" if unknown_count else ""
+    unknown_note = (
+        f" ({unknown_count} catastrophic-class test image(s) had unrecoverable provenance.)" if unknown_count else ""
+    )
 
     if recall_gap >= 0.20:
         verdict = (
             f"LARGE gap ({recall_gap:.3f}) between FDM recall ({fdm_recall:.3f}, n={fdm_n}) and argus_v2 "
             f"recall ({argus_recall:.3f}, n={argus_n}): strong evidence the model is partly keying on "
-            "dataset origin (lighting/framing/compression) rather than the spaghetti defect itself. "
-            "Recall on whichever source is real deployment conditions should be treated as the model's "
-            "true spaghetti recall, not the pooled/average figure."
+            "dataset origin (lighting/framing/compression) rather than the catastrophic-class defect "
+            "itself. Recall on whichever source is real deployment conditions should be treated as the "
+            "model's true catastrophic-class recall, not the pooled/average figure."
         )
     elif recall_gap >= 0.10:
         verdict = (
@@ -623,9 +800,9 @@ def _source_confound_conclusion(
         verdict = (
             f"SMALL gap ({recall_gap:.3f}) between FDM recall ({fdm_recall:.3f}, n={fdm_n}) and argus_v2 "
             f"recall ({argus_recall:.3f}, n={argus_n}): no strong evidence the model is keying on dataset "
-            "origin for spaghetti specifically. This does NOT clear the model of the confound generally "
-            "-- it only means spaghetti's two sources score similarly; the other four defect classes "
-            "have no second source to run this same check against at all."
+            "origin for the catastrophic class specifically. This does NOT clear the model of the "
+            "confound generally -- it only means the catastrophic class's two sources score similarly; "
+            "other defect classes may have no second source to run this same check against at all."
         )
     return verdict + unknown_note
 
@@ -634,8 +811,9 @@ def _source_confound_conclusion(
 # Inputs: dict[str, object] report - the in-progress report dict from build_report (must
 #         already have "p_failure_catastrophic" and "source_confound" populated)
 # Outputs: str - a multi-line human-readable verdict: whether the model is fit to drive
-#          automated print-pausing on the spaghetti path, a precision summary, a source-confound
-#          summary, and (if present) the class-order warning
+#          automated print-pausing on the catastrophic-class path (report["p_failure_catastrophic"]
+#          ["catastrophic_class"]), a precision summary, a source-confound summary, and (if
+#          present) the class-order warning
 # Description: Synthesizes the catastrophic-path precision result and the source-confound
 #              recall gap into one bottom-line recommendation on whether this model should be
 #              allowed to drive automated pause/cancel actions, or should stay notify_only.
@@ -643,6 +821,7 @@ def _source_confound_conclusion(
 def build_interpretation(report: dict[str, object]) -> str:
     cat = report["p_failure_catastrophic"]  # type: ignore[assignment]
     confound = report["source_confound"]  # type: ignore[assignment]
+    catastrophic_class_name = cat["catastrophic_class"]
     target = cat["target_precision"]
     min_recall = cat["min_recall"]
     result = cat["lowest_threshold_for_target_precision"]
@@ -652,14 +831,15 @@ def build_interpretation(report: dict[str, object]) -> str:
     if result is not None:
         precision_ok = True
         precision_summary = (
-            f"the spaghetti (catastrophic) path reaches the target precision ({target:.2f}) at confidence "
-            f"threshold {result['threshold']:.2f}: precision={result['precision']:.3f}, recall={result['recall']:.3f}"
+            f"the {catastrophic_class_name} (catastrophic) path reaches the target precision ({target:.2f}) at "
+            f"confidence threshold {result['threshold']:.2f}: precision={result['precision']:.3f}, "
+            f"recall={result['recall']:.3f}"
         )
     elif vacuous is not None:
         precision_ok = False
         precision_summary = (
-            f"the spaghetti (catastrophic) path only 'reaches' the target precision ({target:.2f}) at a "
-            f"vacuous, near-zero-recall operating point (precision={vacuous['precision']:.3f}, "
+            f"the {catastrophic_class_name} (catastrophic) path only 'reaches' the target precision "
+            f"({target:.2f}) at a vacuous, near-zero-recall operating point (precision={vacuous['precision']:.3f}, "
             f"recall={vacuous['recall']:.3f} @ conf={vacuous['threshold']:.2f} -- the model almost never "
             f"fires there); its best REAL operating point (recall >= {min_recall:.2f}) is "
             f"precision={best['precision']:.3f}, recall={best['recall']:.3f} @ conf={best['threshold']:.2f}"
@@ -667,9 +847,9 @@ def build_interpretation(report: dict[str, object]) -> str:
     else:
         precision_ok = False
         precision_summary = (
-            f"the spaghetti (catastrophic) path NEVER reaches the target precision ({target:.2f}) at any "
-            f"threshold tried; its best real operating point (recall >= {min_recall:.2f}) is "
-            f"precision={best['precision']:.3f}, recall={best['recall']:.3f} @ conf={best['threshold']:.2f}"
+            f"the {catastrophic_class_name} (catastrophic) path NEVER reaches the target precision "
+            f"({target:.2f}) at any threshold tried; its best real operating point (recall >= {min_recall:.2f}) "
+            f"is precision={best['precision']:.3f}, recall={best['recall']:.3f} @ conf={best['threshold']:.2f}"
         )
 
     gap = confound["recall_gap"]
@@ -683,16 +863,16 @@ def build_interpretation(report: dict[str, object]) -> str:
         fdm = by_source.get("fdm", {})
         argus = by_source.get("argus_v2", {})
         confound_summary = (
-            f"spaghetti recall is {fdm.get('recall', float('nan')):.3f} on FDM-sourced test images "
-            f"(n={fdm.get('support', 0)}) vs {argus.get('recall', float('nan')):.3f} on argus_v2-sourced "
+            f"{catastrophic_class_name} recall is {fdm.get('recall', float('nan')):.3f} on FDM-sourced test "
+            f"images (n={fdm.get('support', 0)}) vs {argus.get('recall', float('nan')):.3f} on argus_v2-sourced "
             f"test images (n={argus.get('support', 0)}), a gap of {gap:.3f}"
         )
 
     fit_for_pausing = bool(precision_ok and (confound_ok is not False))
 
     verdict_line = (
-        "This model IS reasonably fit to drive automated print-pausing on the spaghetti path, subject to "
-        "the caveats above."
+        f"This model IS reasonably fit to drive automated print-pausing on the {catastrophic_class_name} path, "
+        "subject to the caveats above."
         if fit_for_pausing
         else "This model is NOT fit to drive automated print-pausing (action_mode should stay notify_only)."
     )
@@ -701,9 +881,11 @@ def build_interpretation(report: dict[str, object]) -> str:
         f"INTERPRETATION: {verdict_line}",
         f"  - Catastrophic-path precision: {precision_summary}.",
         f"  - Source confound: {confound_summary}. {confound['conclusion']}",
-        "  - Only 'spaghetti' can ever drive an automated pause/cancel (config.example.yaml severity "
-        "mapping); every other defect class is cosmetic-only, and 'normal' never emits a detection at "
-        "all, so this catastrophic-path number is the entire automated-action false-positive story.",
+        f"  - Only '{catastrophic_class_name}' can ever drive an automated pause/cancel per the deployed "
+        "severity mapping (config.example.yaml for the 6-class model); 'normal' never emits a detection "
+        "at all (argus.detectors.classifier.postprocess_classify), so this catastrophic-path number is "
+        "the entire automated-action false-positive story for any other class configured as "
+        "cosmetic-only.",
     ]
     if report.get("class_order_warning"):
         lines.append(f"  - {report['class_order_warning']}")
@@ -743,9 +925,10 @@ def print_report(report: dict[str, object]) -> None:
     header = f"{'class':<18}{'precision':>10}{'recall':>10}{'f1':>10}{'support':>10}{'pred_count':>12}"
     print(header)
     print("-" * len(header))
-    for cname in REPORT_CLASS_ORDER:
+    report_catastrophic_class = report["p_failure_catastrophic"]["catastrophic_class"]  # type: ignore[index]
+    for cname in report["report_class_order"]:  # type: ignore[union-attr]
         e = report["per_class"][cname]  # type: ignore[index]
-        tag = "  [CATASTROPHIC]" if cname == CATASTROPHIC_CLASS_NAME else ""
+        tag = "  [CATASTROPHIC]" if cname == report_catastrophic_class else ""
         print(
             f"{cname:<18}{e['precision']:>10.3f}{e['recall']:>10.3f}{e['f1']:>10.3f}"
             f"{e['support']:>10}{e['predicted_count']:>12}{tag}"
@@ -780,8 +963,9 @@ def print_report(report: dict[str, object]) -> None:
     min_recall = cat["min_recall"]
     print(f"[4] p_failure ANALYSIS -- catastrophic path ('{cat['catastrophic_class']}' only)")
     print(
-        f"  Real runtime rule: p_failure = spaghetti probability, ONLY when spaghetti is the model's "
-        f"own top-1 prediction AND that probability clears the threshold."
+        f"  Real runtime rule: p_failure = '{cat['catastrophic_class']}' probability, ONLY when "
+        f"'{cat['catastrophic_class']}' is the model's own top-1 prediction AND that probability clears "
+        f"the threshold."
     )
     print(f"  Threshold sweep (target precision >= {target:.2f}, min_recall floor {min_recall:.2f}):")
     print(f"  {'conf':>6}{'precision':>12}{'recall':>10}{'tp':>6}{'fp':>6}{'fn':>6}{'tn':>6}")
@@ -814,14 +998,20 @@ def print_report(report: dict[str, object]) -> None:
         )
 
     print()
-    print("[5] SOURCE-CONFOUND DIAGNOSTIC -- spaghetti recall by source (the most important check)")
+    print(
+        f"[5] SOURCE-CONFOUND DIAGNOSTIC -- '{cat['catastrophic_class']}' recall by source "
+        "(the most important check)"
+    )
     sc = report["source_confound"]  # type: ignore[assignment]
     print(f"  Provenance method: {sc['method']}")
     for source, entry in sc["by_source"].items():
         recall_str = f"{entry['recall']:.3f}" if entry["recall"] is not None else "n/a"
         print(f"  {source:<12} support={entry['support']:>4}  correct={entry['correct']:>4}  recall={recall_str}")
     if sc["unknown_provenance_count"]:
-        print(f"  WARNING: {sc['unknown_provenance_count']} spaghetti test image(s) had unrecoverable provenance.")
+        print(
+            f"  WARNING: {sc['unknown_provenance_count']} '{cat['catastrophic_class']}' test image(s) had "
+            "unrecoverable provenance."
+        )
     if sc["recall_gap"] is not None:
         print(f"  Recall gap (|FDM - argus_v2|): {sc['recall_gap']:.3f}")
     print(f"  Conclusion: {sc['conclusion']}")
@@ -841,20 +1031,47 @@ def print_report(report: dict[str, object]) -> None:
 # argparse.Namespace parse_args(list[str] | None argv)
 # Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
 # Outputs: argparse.Namespace - parsed evaluation options (weights, data, split, imgsz, batch,
-#          device, target_precision, min_recall, sweep_start/end/step, out). Notable defaults:
-#          --split test, --target-precision 0.95, --min-recall 0.05 (the vacuous-precision
-#          floor, same rationale as training/evaluate.py).
-# Description: Defines and parses the CLI for evaluating the classification checkpoint.
+#          device, target_precision, min_recall, sweep_start/end/step, catastrophic_class, out).
+#          Notable defaults: --split test, --target-precision 0.95, --min-recall 0.05 (the
+#          vacuous-precision floor, same rationale as training/evaluate.py), --catastrophic-class
+#          spaghetti (the 6-class model's convention; pass "failure" for the binary model).
+# Description: Defines and parses the CLI for evaluating the classification checkpoint, for
+#              either backend (select_backend picks between them from --weights' suffix).
 # Side Effects: None (argparse may print usage/help and call sys.exit on bad input, but no
 #               filesystem or network activity)
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS, help=f"Path to trained best.pt (default: {DEFAULT_WEIGHTS})")
+    parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS, help=f"Path to trained best.pt or exported .onnx (default: {DEFAULT_WEIGHTS}); backend is auto-selected from the suffix (select_backend)")
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA_DIR, help=f"Classification dataset root (default: {DEFAULT_DATA_DIR})")
     parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"], help="Which split to evaluate (default: test)")
-    parser.add_argument("--imgsz", type=int, default=512)
-    parser.add_argument("--batch", type=int, default=32)
-    parser.add_argument("--device", type=str, default="0")
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=512,
+        help=(
+            "Input image size (default: 512, matching the 6-class Ultralytics model; the binary "
+            "ONNX model is trained at 320 -- pass --imgsz 320 for it). For the ONNX backend this is "
+            "only a FALLBACK: run_inference_onnx prefers the model's own static input shape baked "
+            "into the ONNX graph (exactly like argus.detectors.classifier.ClassifierDetector does at "
+            "runtime) whenever the graph declares one, and only falls back to this value if the "
+            "graph's input shape is dynamic. The Ultralytics (.pt) backend always uses this value "
+            "directly -- it has no model-declared shape to prefer."
+        ),
+    )
+    parser.add_argument("--batch", type=int, default=32, help="Batch size for the Ultralytics (.pt) backend (default: 32). The ONNX backend always runs batch size 1 in a loop.")
+    parser.add_argument("--device", type=str, default="0", help="CUDA device for the Ultralytics (.pt) backend (default: 0). Unused by the ONNX backend, which always uses CPUExecutionProvider.")
+    parser.add_argument(
+        "--catastrophic-class",
+        type=str,
+        default=CATASTROPHIC_CLASS_NAME,
+        help=(
+            f"Which class drives the p_failure catastrophic-path threshold sweep and the "
+            f"source-confound diagnostic (default: '{CATASTROPHIC_CLASS_NAME}', the 6-class model's "
+            "only CATASTROPHIC-severity class). Pass 'failure' for the binary failure/normal model. "
+            "Must be one of the model's actual class names (resolve_catastrophic_class_index raises "
+            "a clear error listing the model's real classes otherwise)."
+        ),
+    )
     parser.add_argument("--target-precision", type=float, default=0.95)
     parser.add_argument(
         "--min-recall",
@@ -878,15 +1095,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # None main(list[str] | None argv)
 # Inputs: list[str] | None argv - command-line arguments to parse, default None (uses sys.argv)
 # Outputs: None
-# Description: CLI entry point. Lists the requested split's images, warns about classes with
-#              zero images, recovers each image's source provenance, runs inference, builds the
-#              full evaluation report, prints it, and writes it to disk as JSON.
+# Description: CLI entry point. Lists the requested split's images (discovering the actual class
+#              subdirectories present on disk rather than assuming the 6-class REPORT_CLASS_ORDER,
+#              so this works for the binary failure/normal dataset too), warns about missing
+#              6-class-model classes when applicable, recovers each image's source provenance,
+#              selects the inference backend from --weights' suffix (select_backend) and runs it,
+#              builds the full evaluation report, prints it, and writes it to disk as JSON.
 # Side Effects: Raises FileNotFoundError if --weights or --data don't exist; raises
-#               RuntimeError if the split has no images at all; runs a full GPU/CPU inference
-#               pass reading every listed image from disk (see run_inference); prints progress,
-#               warnings, and the full evaluation report to stdout; creates --out's parent
-#               directory and writes the full JSON report to --out (default
-#               runs/classifier_evaluation.json).
+#               RuntimeError if the split has no images at all; runs a full GPU/CPU (Ultralytics)
+#               or CPU (ONNX) inference pass reading every listed image from disk (see
+#               run_inference / run_inference_onnx); prints progress, warnings, and the full
+#               evaluation report to stdout; creates --out's parent directory and writes the full
+#               JSON report to --out (default runs/classifier_evaluation.json).
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
@@ -896,21 +1116,37 @@ def main(argv: list[str] | None = None) -> None:
         raise FileNotFoundError(f"Dataset directory not found: {args.data}")
 
     print(f"[evaluate_classifier] Listing '{args.split}' split images under '{args.data}' ...")
-    records = list_split_images(args.data, args.split, REPORT_CLASS_ORDER)
+    # Discover the class subdirectories actually present on disk rather than assuming
+    # REPORT_CLASS_ORDER -- the binary model's dataset has "failure"/"normal" folders, not the
+    # 6-class set, and list_split_images only lists whatever class_names it's given.
+    split_dir = args.data / args.split
+    discovered_classes = tuple(sorted(p.name for p in split_dir.iterdir() if p.is_dir())) if split_dir.is_dir() else ()
+    class_names_for_listing = discovered_classes if discovered_classes else REPORT_CLASS_ORDER
+
+    records = list_split_images(args.data, args.split, class_names_for_listing)
     if not records:
         raise RuntimeError(f"No images found for split '{args.split}' under '{args.data}'")
 
     present_classes = {c for _, c in records}
-    missing_classes = [c for c in REPORT_CLASS_ORDER if c not in present_classes]
-    if missing_classes:
-        print(f"[evaluate_classifier] WARNING: these classes have ZERO images in split '{args.split}': {missing_classes}")
+    # The "missing classes" warning only makes sense when this looks like the known 6-class
+    # dataset (some classes may legitimately have zero test images, e.g. evaluable: false in
+    # split_report.json); for any other class set (e.g. the binary dataset) there is no such
+    # expectation to check.
+    if set(class_names_for_listing) <= set(REPORT_CLASS_ORDER):
+        missing_classes = [c for c in REPORT_CLASS_ORDER if c not in present_classes]
+        if missing_classes:
+            print(f"[evaluate_classifier] WARNING: these classes have ZERO images in split '{args.split}': {missing_classes}")
 
     paths = [p for p, _ in records]
     y_true = [c for _, c in records]
     sources = [infer_source(p.name) for p in paths]
 
-    print(f"[evaluate_classifier] Running inference on {len(paths)} images with '{args.weights}' ...")
-    probs, names_by_idx = run_inference(args.weights, paths, args.imgsz, args.batch, args.device)
+    backend = select_backend(args.weights)
+    print(f"[evaluate_classifier] Running inference ({backend} backend) on {len(paths)} images with '{args.weights}' ...")
+    if backend == "onnx":
+        probs, names_by_idx = run_inference_onnx(args.weights, paths, args.imgsz)
+    else:
+        probs, names_by_idx = run_inference(args.weights, paths, args.imgsz, args.batch, args.device)
 
     report = build_report(y_true, probs, names_by_idx, sources, args)
     print_report(report)

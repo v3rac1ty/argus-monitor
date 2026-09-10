@@ -19,9 +19,10 @@ from types import FrameType
 from typing import Optional
 
 from argus.camera import FrameSource, build_source
-from argus.config import Config, load_config
+from argus.config import Config, DetectorConfig, load_config
 from argus.decision import DecisionEngine
 from argus.detectors.base import Detector
+from argus.detectors.classifier import ClassifierDetector
 from argus.detectors.mock import MockDetector
 from argus.detectors.onnx_yolo import OnnxYoloDetector
 from argus.moonraker import MoonrakerClient
@@ -340,6 +341,25 @@ class ArgusService:
                 logger.debug("could not install handler for %s", sig_name)
 
 
+# Detector build_detector(DetectorConfig cfg)
+# Inputs: DetectorConfig cfg - the detector configuration section (kind, model_path, providers,
+#                 input_size, class_names, thresholds, severity map, etc.)
+# Outputs: Detector - a `ClassifierDetector` when `cfg.kind == "classification"`, otherwise an
+#          `OnnxYoloDetector` (the default "detection" kind)
+# Description: Dispatches on `cfg.kind` -- already validated against `_VALID_DETECTOR_KINDS` in
+#              argus.config -- to construct the concrete `Detector` implementation that should
+#              actually run inference. Kept as a standalone function rather than inlined in
+#              `build_service` so the kind-to-class dispatch is unit-testable on its own, without
+#              constructing a whole service or requiring a real ONNX model file on disk.
+# Side Effects: Constructing either concrete detector reads `cfg.model_path` from disk (raising
+#               FileNotFoundError if missing) and allocates an onnxruntime InferenceSession --
+#               see ClassifierDetector.__init__ / OnnxYoloDetector.__init__ for specifics.
+def build_detector(cfg: DetectorConfig) -> Detector:
+    if cfg.kind == "classification":
+        return ClassifierDetector(cfg)
+    return OnnxYoloDetector(cfg)
+
+
 # ArgusService build_service(Config cfg, bool dry_run=False, Optional[FrameSource] source_override=None, Optional[Detector] detector_override=None)
 # Inputs: Config cfg - the full validated configuration
 #         bool dry_run - if True, ArgusService skips Moonraker calls and notifications; defaults
@@ -347,15 +367,19 @@ class ArgusService:
 #         Optional[FrameSource] source_override - replaces the camera source built from
 #                                                   `cfg.camera`; defaults to None (build from
 #                                                   cfg); used by the CLI's --source flag / tests
-#         Optional[Detector] detector_override - replaces the ONNX detector built from
-#                                                 `cfg.detector`; defaults to None (build from
-#                                                 cfg); used by the CLI's --mock flag
+#         Optional[Detector] detector_override - replaces the detector `build_detector` would
+#                                                 otherwise construct from `cfg.detector`;
+#                                                 defaults to None (dispatch on cfg.detector.kind
+#                                                 via build_detector); used by the CLI's --mock
+#                                                 flag
 # Outputs: ArgusService - a fully wired service with real collaborators
 # Description: Assembles the real FrameSource, Detector, DecisionEngine, MoonrakerClient,
 #              Notifier, and EventStore from `cfg` (honoring any overrides) and injects them into
-#              a new ArgusService.
+#              a new ArgusService. The detector is chosen by `build_detector(cfg.detector)` --
+#              `ClassifierDetector` or `OnnxYoloDetector` depending on `cfg.detector.kind` --
+#              unless `detector_override` is given, which always wins.
 # Side Effects: Constructing the real collaborators may touch hardware/network/filesystem (e.g.
-#               OnnxYoloDetector loading a model file, MoonrakerClient/build_notifier creating
+#               build_detector loading a model file, MoonrakerClient/build_notifier creating
 #               HTTP sessions) -- see each collaborator's own __init__ for specifics.
 def build_service(
     cfg: Config,
@@ -365,7 +389,7 @@ def build_service(
     detector_override: Optional[Detector] = None,
 ) -> ArgusService:
     source = source_override if source_override is not None else build_source(cfg.camera)
-    detector = detector_override if detector_override is not None else OnnxYoloDetector(cfg.detector)
+    detector = detector_override if detector_override is not None else build_detector(cfg.detector)
     engine = DecisionEngine(cfg.decision)
     moonraker = MoonrakerClient(cfg.moonraker)
     notifier = build_notifier(cfg.notify)

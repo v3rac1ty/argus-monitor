@@ -27,6 +27,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+from argus import service as service_module
 from argus.config import (
     CameraConfig,
     Config,
@@ -479,3 +480,84 @@ def test_mock_score_end_to_end_zero_score_never_triggers_action(tmp_path):
     moonraker.pause.assert_not_called()
     moonraker.cancel.assert_not_called()
     notifier.send.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# 11. build_detector / build_service dispatch on detector.kind
+#
+# `detector.kind` is parsed and validated in argus.config, but until this
+# fix nothing ever read it back to choose a detector class -- build_service
+# always hardcoded OnnxYoloDetector. These tests pin the dispatch: each
+# concrete constructor is monkeypatched to a stand-in that fails the test if
+# called when it shouldn't be, so no real ONNX model file is ever needed.
+# --------------------------------------------------------------------------
+
+
+def test_build_detector_classification_kind_constructs_classifier_detector(monkeypatch):
+    sentinel = object()
+    calls: list[DetectorConfig] = []
+
+    def fake_classifier_detector(cfg: DetectorConfig) -> object:
+        calls.append(cfg)
+        return sentinel
+
+    monkeypatch.setattr(service_module, "ClassifierDetector", fake_classifier_detector)
+    monkeypatch.setattr(
+        service_module,
+        "OnnxYoloDetector",
+        lambda cfg: pytest.fail("OnnxYoloDetector must not be constructed for kind='classification'"),
+    )
+
+    cfg = DetectorConfig(kind="classification", class_names=("normal", "spaghetti"))
+    result = service_module.build_detector(cfg)
+
+    assert result is sentinel
+    assert calls == [cfg]
+
+
+def test_build_detector_detection_kind_constructs_onnx_yolo_detector(monkeypatch):
+    sentinel = object()
+    calls: list[DetectorConfig] = []
+
+    def fake_onnx_yolo_detector(cfg: DetectorConfig) -> object:
+        calls.append(cfg)
+        return sentinel
+
+    monkeypatch.setattr(service_module, "OnnxYoloDetector", fake_onnx_yolo_detector)
+    monkeypatch.setattr(
+        service_module,
+        "ClassifierDetector",
+        lambda cfg: pytest.fail("ClassifierDetector must not be constructed for kind='detection'"),
+    )
+
+    cfg = DetectorConfig(kind="detection")
+    result = service_module.build_detector(cfg)
+
+    assert result is sentinel
+    assert calls == [cfg]
+
+
+def test_build_service_detector_override_wins_over_kind_dispatch(monkeypatch):
+    # Neither concrete constructor may be called: an explicit
+    # detector_override must short-circuit build_detector entirely -- this
+    # is how the CLI's --mock flag injects MockDetector regardless of
+    # cfg.detector.kind.
+    monkeypatch.setattr(
+        service_module,
+        "ClassifierDetector",
+        lambda cfg: pytest.fail("ClassifierDetector must not be constructed when detector_override is given"),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "OnnxYoloDetector",
+        lambda cfg: pytest.fail("OnnxYoloDetector must not be constructed when detector_override is given"),
+    )
+
+    cfg = make_cfg()
+    override = MockDetector([0.0], cycle=True)
+
+    built = service_module.build_service(cfg, detector_override=override)
+    try:
+        assert built._detector is override
+    finally:
+        built.close()

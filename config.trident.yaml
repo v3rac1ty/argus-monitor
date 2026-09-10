@@ -1,0 +1,166 @@
+# Argus Monitor configuration for a Voron Trident, running the trained
+# binary (failure/normal) whole-frame classifier.
+#
+# Copy of config.example.yaml with the detector switched to the
+# "classification" path and calibrated against the real measured artifacts:
+#   - models/argus_bin.onnx           (trained, exported, static 1x3x320x320 input)
+#   - runs/eval_bin_test.json         (test-split evaluation report)
+#   - tools/calibrate.py replay of the real DecisionEngine (see decision: below)
+#
+# Any string value of the exact form "env:VAR_NAME" is replaced at load time
+# with os.environ["VAR_NAME"] (or None if that variable is unset). Use this
+# to keep secrets such as the Discord webhook URL out of version control.
+
+# Camera capture: where frames come from and at what size/rate.
+camera:
+  source: "0"              # "0"=/dev/video0, an http(s) MJPEG/snapshot URL, or a directory path for replay
+  width: 1280
+  height: 720
+  fps: 5
+  reconnect_backoff_s: 2.0
+  max_reconnect_backoff_s: 30.0
+
+# ONNX detector: models/argus_bin.onnx, a whole-frame binary classifier
+# (failure vs. normal), NOT the multi-class object detector.
+#
+# class_thresholds and severity must list exactly the same class names --
+# every class needs both a threshold and a severity, or config loading will
+# fail (see argus.config._validate, which checks
+# set(class_thresholds) == set(severity)).
+detector:
+  kind: "classification"
+  model_path: "models/argus_bin.onnx"
+  # Model is exported with a STATIC input of (1, 3, 320, 320); ClassifierDetector
+  # reads the static shape straight off the ONNX graph and this value is only
+  # the fallback if that ever fails, but it must still match the training/export
+  # size.
+  input_size: 320
+  providers: ["CPUExecutionProvider"]
+  # This order is not arbitrary -- it is the model's REAL output index order,
+  # embedded in the ONNX metadata itself (custom_metadata_map["names"] ==
+  # "{0: 'failure', 1: 'normal'}", verified by reading the exported model
+  # directly). argus.detectors.classifier.resolve_class_names() cross-checks
+  # this list against that same metadata at load time and raises ValueError
+  # on any mismatch, so getting this order wrong fails loudly at startup
+  # rather than silently mislabeling every prediction.
+  class_names: ["failure", "normal"]
+  default_threshold: 0.50
+  class_thresholds:
+    # 0.75 is not a round-number guess -- it is the exact confidence value at
+    # which runs/eval_bin_test.json's threshold sweep first reaches
+    # precision 1.000 / zero false positives (1/236 normal images
+    # misclassified at every threshold below 0.75; 0/236 at 0.75 and above).
+    # Recall at this point is 0.674 (64/95 failures caught). Precision is
+    # already flat at 0.988 all the way from conf 0.05 to 0.70, so 0.75 is
+    # the FIRST point that buys zero false positives, not an arbitrary
+    # conservative pad -- see runs/eval_bin_test.json
+    # p_failure_catastrophic.confidence_sweep.
+    failure: 0.75
+    # Never consulted: postprocess_classify() short-circuits any "normal"
+    # argmax to zero detections before any threshold is checked (see
+    # ClassifierDetector module docstring). Listed only because
+    # class_thresholds and severity must define exactly the same class-name
+    # set, or argus.config.ConfigError is raised at load time.
+    normal: 0.50
+  severity:
+    # The only catastrophic class -- a "failure" prediction above threshold
+    # is the sole signal that can ever reach the DecisionEngine's p_failure
+    # (see DetectionResult.p_failure: max confidence among CATASTROPHIC
+    # detections only).
+    failure: catastrophic
+    # Never consulted at runtime (see class_thresholds.normal above for why
+    # it's still listed) -- a "normal" prediction produces zero Detections,
+    # not a cosmetic one.
+    normal: cosmetic
+
+# Temporal DecisionEngine: turns a stream of per-frame classifier scores into
+# a smoothed score and, eventually, an action (notify / pause / cancel).
+#
+# pause_score/pause_votes/ema_alpha: tools/calibrate.py --sweep was run over
+# a 4x5x5 grid of these three values (pause_score in [0.55,0.65,0.75,0.85],
+# pause_votes in [3,4,6,8,10], ema_alpha in [0.20,0.35,0.50,0.65,0.80] --
+# window=12 fixed, so pause_votes was kept <= window) against two synthetic
+# traces built from datasets/argus_bin/test/{normal,failure} (tick_interval_s
+# overridden to 60s for the replay only -- see the calibration report).
+# Measured result: EVERY cell in the grid scored 0 false-positives/hour on
+# the 236-frame normal trace, because ClassifierDetector's own class_thresholds.failure=0.75
+# already produces p_raw == 0.0 for all 236 of those frames -- there is no
+# raw positive signal left for the temporal engine to filter at this
+# operating point, so the sweep could not distinguish settings on false
+# positives alone. On detection latency (95-frame failure trace,
+# failure-start-tick=0) the grid bottomed out at a 360.0s mean
+# time-to-detect (100% detected), achieved by ema_alpha >= 0.35 combined
+# with most pause_score/pause_votes values -- including config.example.yaml's
+# original defaults below, which is why they are kept unchanged rather than
+# replaced: they already sit on the measured zero-FP / fastest-detection
+# frontier. See the calibration report for the full grid and both traces'
+# numbers, and the caveat below about what this evidence does and does not
+# establish.
+decision:
+  tick_interval_s: 1.0
+  warmup_s: 180
+  ema_alpha: 0.35
+  window: 12
+  vote_threshold: 0.55
+  warn_score: 0.60
+  warn_votes: 4
+  pause_score: 0.75
+  pause_votes: 6
+  pause_consecutive: 3
+  cancel_score: 0.92
+  cancel_votes: 9
+  cancel_consecutive: 2
+  cancel_enabled: false
+  clear_score: 0.40
+  clear_ticks: 5
+  cooldown_s: 300
+  # notify_only MUST ship as the default here. The classifier's own
+  # measured precision (0.988 flat from conf 0.05-0.70, 1.000 only at
+  # conf >= 0.75) is real and much better than the multi-class model this
+  # example config was written against, and tools/calibrate.py measured 0
+  # false positives / hour and 100% detection (360.0s mean time-to-detect)
+  # replaying the DecisionEngine end-to-end against the test split. But
+  # both of those numbers come from datasets/argus_bin/test/{normal,failure}
+  # -- public-dataset images, cluster-disjoint from training, replayed as a
+  # SYNTHETIC per-image time series (arbitrary file order, fabricated
+  # timestamps) -- NOT real footage recorded on this user's Voron Trident,
+  # under its actual lighting/camera/vibration/background. Pausing a live
+  # print on evidence gathered this way would be premature -- enable pause
+  # only after tools/calibrate.py has been re-run against real recorded
+  # footage from this printer and demonstrates an acceptable
+  # false-positives-per-hour figure on THAT footage.
+  action_mode: "notify_only"   # notify_only | pause | cancel -- ceiling on automated action
+
+# Pre-inference frame quality gate: reject frames too dark/bright/blurry/stale
+# to trust, rather than feeding garbage into the detector and decision engine.
+quality:
+  min_mean_luma: 20.0
+  max_mean_luma: 240.0
+  min_blur_var: 45.0
+  max_frame_age_s: 5.0
+
+# Moonraker (Klipper API) connection used to poll print state and, if
+# action_mode allows it, pause/cancel the print.
+moonraker:
+  base_url: "http://localhost:7125"
+  timeout_s: 5.0
+  poll_interval_s: 1.0
+  pause_macro: null        # e.g. "DETECTION_PAUSE" to call a gcode macro instead of the raw pause endpoint
+
+# Discord webhook notifications. discord_webhook_url is loaded from the
+# DISCORD_WEBHOOK_URL environment variable so it never ends up committed.
+notify:
+  discord_webhook_url: "env:DISCORD_WEBHOOK_URL"
+  attach_frame: true
+  min_interval_s: 60
+
+# Local storage: where the JSONL event log and captured frames are written,
+# and how much of that to keep.
+storage:
+  event_log: "logs/events.jsonl"
+  frame_dir: "captures"
+  max_frames: 500
+  retention_days: 14
+
+logging:
+  level: "INFO"

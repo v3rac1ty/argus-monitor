@@ -2,16 +2,29 @@
 confusion-matrix construction, per-class precision/recall/F1, the binary
 normal-vs-defect collapse, the catastrophic-path (spaghetti) threshold
 sweep, its near-zero-recall "vacuous precision" guard, the source-confound
-recall grouping, and filename-based source inference.
+recall grouping, and filename-based source inference. Also covers the ONNX
+inference backend (select_backend, run_inference_onnx) and the
+6-class/binary generalisation (resolve_report_class_order,
+resolve_catastrophic_class_index, and build_report's graceful degradation
+of the source-confound diagnostic for a single-source dataset).
 
 Everything here operates on synthetic class-name lists / hand-built
-CatastrophicRecord objects -- no model file, no GPU, no dataset on disk.
+CatastrophicRecord objects, a monkeypatched onnxruntime session, and tiny
+synthetic images written to tmp_path -- no real ONNX file, no network, no
+GPU.
 """
 
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
+from typing import Any, Optional
+
+import cv2
+import numpy as np
 import pytest
 
+from argus.detectors import classifier as classifier_module
 from training.evaluate_classifier import (
     REPORT_CLASS_ORDER,
     CatastrophicRecord,
@@ -19,12 +32,17 @@ from training.evaluate_classifier import (
     binary_labels,
     binary_metrics,
     build_confusion_matrix,
+    build_report,
     check_class_order_matches_model,
     evaluate_catastrophic_threshold,
     find_lowest_threshold_for_precision,
     group_recall_by_source,
     infer_source,
     per_class_prf1,
+    resolve_catastrophic_class_index,
+    resolve_report_class_order,
+    run_inference_onnx,
+    select_backend,
     sweep_catastrophic,
     sweep_thresholds,
     top1_accuracy,
@@ -373,3 +391,364 @@ def test_check_class_order_matches_model_warns_on_alphabetical_mismatch():
     assert warning is not None
     assert "CLASS ORDER MISMATCH" in warning
     assert "ClassifierDetector" in warning
+
+
+# --------------------------------------------------------------------------
+# select_backend
+# --------------------------------------------------------------------------
+
+
+def test_select_backend_onnx_suffix():
+    assert select_backend(Path("model.onnx")) == "onnx"
+
+
+def test_select_backend_onnx_suffix_case_insensitive():
+    assert select_backend(Path("model.ONNX")) == "onnx"
+
+
+def test_select_backend_pt_suffix_is_ultralytics():
+    assert select_backend(Path("best.pt")) == "ultralytics"
+
+
+def test_select_backend_no_suffix_defaults_to_ultralytics():
+    assert select_backend(Path("weights_dir")) == "ultralytics"
+
+
+# --------------------------------------------------------------------------
+# resolve_report_class_order -- 6-class vs binary generalisation
+# --------------------------------------------------------------------------
+
+
+def test_resolve_report_class_order_uses_curated_order_for_six_class_model():
+    # Model's real (alphabetical) index order differs from REPORT_CLASS_ORDER's
+    # human-readable order, but the *set* of classes matches the known 6-class
+    # model -- the curated human order should still be used for reporting.
+    alphabetical = sorted(REPORT_CLASS_ORDER)
+    names_by_idx = {i: name for i, name in enumerate(alphabetical)}
+    assert resolve_report_class_order(names_by_idx) == REPORT_CLASS_ORDER
+
+
+def test_resolve_report_class_order_falls_back_to_model_order_for_binary_model():
+    # The binary model's classes aren't the 6-class set at all -- there's no
+    # curated human order to assume, so the model's own real order is used.
+    names_by_idx = {0: "failure", 1: "normal"}
+    assert resolve_report_class_order(names_by_idx) == ("failure", "normal")
+
+
+# --------------------------------------------------------------------------
+# resolve_catastrophic_class_index
+# --------------------------------------------------------------------------
+
+
+def test_resolve_catastrophic_class_index_six_class_model():
+    names_by_idx = {0: "normal", 1: "spaghetti", 2: "cracking"}
+    assert resolve_catastrophic_class_index(names_by_idx, "spaghetti") == 1
+
+
+def test_resolve_catastrophic_class_index_binary_model():
+    names_by_idx = {0: "failure", 1: "normal"}
+    assert resolve_catastrophic_class_index(names_by_idx, "failure") == 0
+
+
+def test_resolve_catastrophic_class_index_unknown_class_raises_with_helpful_message():
+    names_by_idx = {0: "failure", 1: "normal"}
+    with pytest.raises(ValueError) as excinfo:
+        resolve_catastrophic_class_index(names_by_idx, "spaghetti")
+    message = str(excinfo.value)
+    # Both the bad input and the model's real classes must be named so the
+    # operator can fix --catastrophic-class without digging through metadata.
+    assert "spaghetti" in message
+    assert "failure" in message
+    assert "normal" in message
+
+
+# --------------------------------------------------------------------------
+# build_report -- 6-class/binary generalisation and the source-confound
+# diagnostic's graceful degradation for a single-source dataset.
+# --------------------------------------------------------------------------
+
+
+def _binary_args(**overrides: object) -> argparse.Namespace:
+    defaults: dict[str, object] = dict(
+        weights=Path("model.onnx"),
+        data=Path("dataset"),
+        split="test",
+        target_precision=0.95,
+        min_recall=0.05,
+        sweep_start=0.05,
+        sweep_end=0.95,
+        sweep_step=0.05,
+        catastrophic_class="failure",
+    )
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def test_build_report_binary_model_uses_model_order_and_no_class_order_warning():
+    names_by_idx = {0: "failure", 1: "normal"}
+    y_true = ["failure", "failure", "normal", "normal"]
+    probs = np.array([[0.9, 0.1], [0.8, 0.2], [0.2, 0.8], [0.1, 0.9]])
+    sources = ["hf", "hf", "hf", "hf"]
+    report = build_report(y_true, probs, names_by_idx, sources, _binary_args())
+    assert report["report_class_order"] == ["failure", "normal"]
+    assert report["class_order_warning"] is None
+    assert report["p_failure_catastrophic"]["catastrophic_class"] == "failure"
+
+
+def test_build_report_single_source_degrades_gracefully_instead_of_bogus_conclusion():
+    names_by_idx = {0: "failure", 1: "normal"}
+    y_true = ["failure", "failure", "normal", "normal"]
+    probs = np.array([[0.9, 0.1], [0.8, 0.2], [0.2, 0.8], [0.1, 0.9]])
+    # Every image resolves to the SAME single source -- the degenerate case
+    # for a single-Hugging-Face-source binary dataset.
+    sources = ["hf", "hf", "hf", "hf"]
+    report = build_report(y_true, probs, names_by_idx, sources, _binary_args())
+
+    sc = report["source_confound"]
+    assert sc["recall_gap"] is None
+    assert "NOT APPLICABLE" in sc["conclusion"]
+    # Must not read as the misleading "sources (fdm, argus_v2) were not
+    # found" framing -- that implies two specific sources were expected.
+    assert "fdm, argus_v2" not in sc["conclusion"]
+
+
+def test_build_report_zero_catastrophic_samples_also_degrades_gracefully():
+    # No true "failure" images at all -- by_source is empty, not length 1,
+    # but must still be treated as "not applicable" rather than crashing on
+    # an fdm/argus_v2 lookup against an empty dict.
+    names_by_idx = {0: "failure", 1: "normal"}
+    y_true = ["normal", "normal"]
+    probs = np.array([[0.1, 0.9], [0.2, 0.8]])
+    report = build_report(y_true, probs, names_by_idx, ["hf", "hf"], _binary_args())
+    sc = report["source_confound"]
+    assert sc["by_source"] == {}
+    assert "NOT APPLICABLE" in sc["conclusion"]
+
+
+def test_build_report_unknown_catastrophic_class_raises():
+    names_by_idx = {0: "failure", 1: "normal"}
+    y_true = ["failure", "normal"]
+    probs = np.array([[0.9, 0.1], [0.1, 0.9]])
+    args = _binary_args(catastrophic_class="spaghetti")
+    with pytest.raises(ValueError) as excinfo:
+        build_report(y_true, probs, names_by_idx, ["hf", "hf"], args)
+    assert "spaghetti" in str(excinfo.value)
+
+
+def test_build_report_six_class_model_still_reaches_multi_source_conclusion():
+    # Sanity check that the existing 6-class multi-source path (fdm vs
+    # argus_v2) is unaffected by the new single-source degradation branch.
+    names_by_idx = {i: name for i, name in enumerate(REPORT_CLASS_ORDER)}
+    y_true = ["spaghetti"] * 6 + ["normal"] * 2
+    probs = np.zeros((8, 6))
+    spaghetti_idx = REPORT_CLASS_ORDER.index("spaghetti")
+    normal_idx = REPORT_CLASS_ORDER.index("normal")
+    for i in range(6):
+        probs[i, spaghetti_idx] = 0.9
+    for i in range(6, 8):
+        probs[i, normal_idx] = 0.9
+    sources = ["fdm", "fdm", "fdm", "argus_v2", "argus_v2", "argus_v2", "fdm", "argus_v2"]
+    args = _binary_args(weights=Path("best.pt"), catastrophic_class="spaghetti")
+    report = build_report(y_true, probs, names_by_idx, sources, args)
+    sc = report["source_confound"]
+    assert sc["recall_gap"] is not None
+    assert "NOT APPLICABLE" not in sc["conclusion"]
+
+
+# --------------------------------------------------------------------------
+# run_inference_onnx -- fakes matching tests/test_classifier_detector.py's
+# _FakeSession/_FakeInput/_FakeModelMeta pattern, extended with a working
+# run() method so the full pipeline (preprocess -> session.run ->
+# probabilities) can be exercised with no real ONNX file, no network, no GPU.
+# --------------------------------------------------------------------------
+
+
+class _FakeOnnxInput:
+    def __init__(self, name: str = "input", shape: tuple[object, ...] = (1, 3, 320, 320)):
+        self.name = name
+        self.shape = shape
+
+
+class _FakeOnnxModelMeta:
+    def __init__(self, custom_metadata_map: dict[str, str]):
+        self.custom_metadata_map = custom_metadata_map
+
+
+class _FakeOnnxSession:
+    """Stand-in for onnxruntime.InferenceSession: get_modelmeta() and
+    get_inputs() are read by run_inference_onnx exactly like
+    ClassifierDetector reads them, and run() returns a fixed raw output row
+    regardless of the actual input blob, so tests can control precisely
+    what "the model" outputs without a real ONNX graph."""
+
+    def __init__(
+        self,
+        custom_metadata_map: Optional[dict[str, str]] = None,
+        input_shape: tuple[object, ...] = (1, 3, 320, 320),
+        raw_output: Optional[np.ndarray] = None,
+    ):
+        self._modelmeta = _FakeOnnxModelMeta(custom_metadata_map or {})
+        self._inputs = [_FakeOnnxInput(shape=input_shape)]
+        self._raw_output = raw_output if raw_output is not None else np.array([[2.0, 0.0]])
+        self.run_call_count = 0
+
+    def get_modelmeta(self) -> _FakeOnnxModelMeta:
+        return self._modelmeta
+
+    def get_inputs(self) -> list[_FakeOnnxInput]:
+        return self._inputs
+
+    def run(self, output_names: Any, input_feed: Any) -> Any:
+        self.run_call_count += 1
+        return [self._raw_output]
+
+
+def _onnx_metadata_for(names_by_idx: dict[int, str]) -> dict[str, str]:
+    """Same shape Ultralytics/the export script actually writes: a 'names'
+    entry holding the Python repr of an {index: name} dict."""
+    return {"names": repr(names_by_idx)}
+
+
+def _write_tiny_image(path: Path, size: int = 40) -> None:
+    rng = np.random.default_rng(seed=0)
+    image = rng.integers(0, 256, (size, size, 3), dtype=np.uint8)
+    assert cv2.imwrite(str(path), image)
+
+
+def test_run_inference_onnx_returns_correctly_shaped_probs(tmp_path, monkeypatch):
+    import onnxruntime
+
+    names_by_idx = {0: "failure", 1: "normal"}
+    raw_logits = np.array([[2.0, -1.0]])  # NOT already a probability distribution
+    fake_session = _FakeOnnxSession(custom_metadata_map=_onnx_metadata_for(names_by_idx), raw_output=raw_logits)
+    monkeypatch.setattr(onnxruntime, "InferenceSession", lambda *a, **kw: fake_session)
+
+    image_paths = [tmp_path / f"img_{i}.png" for i in range(3)]
+    for p in image_paths:
+        _write_tiny_image(p)
+
+    probs, names = run_inference_onnx(tmp_path / "model.onnx", image_paths, imgsz=32)
+
+    assert probs.shape == (3, 2)
+    assert names == names_by_idx
+    for row in probs:
+        assert row.sum() == pytest.approx(1.0, abs=1e-9)
+    # probabilities_from_output must have actually softmax'd these raw
+    # logits (they don't sum to 1 / aren't in [0,1]) rather than passing
+    # them through unchanged.
+    expected = classifier_module.softmax(raw_logits)[0]
+    np.testing.assert_allclose(probs[0], expected)
+
+
+def test_run_inference_onnx_calls_real_preprocess_and_probability_functions(tmp_path, monkeypatch):
+    # Proves reuse of the actual production functions rather than a
+    # reimplementation: spies wrap the real implementations so behaviour is
+    # unchanged, but we can assert they were actually invoked once per image.
+    import onnxruntime
+
+    names_by_idx = {0: "failure", 1: "normal"}
+    fake_session = _FakeOnnxSession(
+        custom_metadata_map=_onnx_metadata_for(names_by_idx), raw_output=np.array([[3.0, 1.0]])
+    )
+    monkeypatch.setattr(onnxruntime, "InferenceSession", lambda *a, **kw: fake_session)
+
+    calls = {"preprocess": 0, "probs": 0}
+    real_preprocess = classifier_module.preprocess_classify
+    real_probs = classifier_module.probabilities_from_output
+
+    def spy_preprocess(image, input_size):
+        calls["preprocess"] += 1
+        return real_preprocess(image, input_size)
+
+    def spy_probs(raw):
+        calls["probs"] += 1
+        return real_probs(raw)
+
+    monkeypatch.setattr(classifier_module, "preprocess_classify", spy_preprocess)
+    monkeypatch.setattr(classifier_module, "probabilities_from_output", spy_probs)
+
+    image_paths = [tmp_path / f"img_{i}.png" for i in range(3)]
+    for p in image_paths:
+        _write_tiny_image(p)
+
+    run_inference_onnx(tmp_path / "model.onnx", image_paths, imgsz=32)
+
+    assert calls["preprocess"] == 3
+    assert calls["probs"] == 3
+    assert fake_session.run_call_count == 3
+
+
+def test_run_inference_onnx_prefers_model_static_shape_over_imgsz_arg(tmp_path, monkeypatch):
+    import onnxruntime
+
+    names_by_idx = {0: "failure", 1: "normal"}
+    fake_session = _FakeOnnxSession(
+        custom_metadata_map=_onnx_metadata_for(names_by_idx),
+        input_shape=(1, 3, 320, 320),
+        raw_output=np.array([[0.5, 0.5]]),
+    )
+    monkeypatch.setattr(onnxruntime, "InferenceSession", lambda *a, **kw: fake_session)
+
+    captured_sizes: list[int] = []
+    real_preprocess = classifier_module.preprocess_classify
+
+    def spy_preprocess(image, input_size):
+        captured_sizes.append(input_size)
+        return real_preprocess(image, input_size)
+
+    monkeypatch.setattr(classifier_module, "preprocess_classify", spy_preprocess)
+
+    image_path = tmp_path / "img.png"
+    _write_tiny_image(image_path)
+
+    run_inference_onnx(tmp_path / "model.onnx", [image_path], imgsz=512)
+
+    # The model's static 320x320 input shape wins over --imgsz 512.
+    assert captured_sizes == [320]
+
+
+def test_run_inference_onnx_falls_back_to_imgsz_when_shape_is_dynamic(tmp_path, monkeypatch):
+    import onnxruntime
+
+    names_by_idx = {0: "failure", 1: "normal"}
+    fake_session = _FakeOnnxSession(
+        custom_metadata_map=_onnx_metadata_for(names_by_idx),
+        input_shape=(1, 3, "height", "width"),
+        raw_output=np.array([[0.5, 0.5]]),
+    )
+    monkeypatch.setattr(onnxruntime, "InferenceSession", lambda *a, **kw: fake_session)
+
+    captured_sizes: list[int] = []
+    real_preprocess = classifier_module.preprocess_classify
+
+    def spy_preprocess(image, input_size):
+        captured_sizes.append(input_size)
+        return real_preprocess(image, input_size)
+
+    monkeypatch.setattr(classifier_module, "preprocess_classify", spy_preprocess)
+
+    image_path = tmp_path / "img.png"
+    _write_tiny_image(image_path)
+
+    run_inference_onnx(tmp_path / "model.onnx", [image_path], imgsz=48)
+
+    # A dynamic (non-square/symbolic) input shape falls back to --imgsz.
+    assert captured_sizes == [48]
+
+
+def test_run_inference_onnx_missing_class_metadata_raises(tmp_path, monkeypatch):
+    import onnxruntime
+
+    fake_session = _FakeOnnxSession(custom_metadata_map={})
+    monkeypatch.setattr(onnxruntime, "InferenceSession", lambda *a, **kw: fake_session)
+
+    image_path = tmp_path / "img.png"
+    _write_tiny_image(image_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        run_inference_onnx(tmp_path / "model.onnx", [image_path], imgsz=32)
+    message = str(excinfo.value)
+    assert "class-name metadata" in message
+    # Session.run must never have been reached -- fail loudly before any
+    # inference, not partway through.
+    assert fake_session.run_call_count == 0
