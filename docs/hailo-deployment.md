@@ -8,28 +8,41 @@ Everything before and after it -- the ONNX re-export, the calibration set,
 the Pi-side install and config, and the mandatory post-quantization
 threshold re-derivation -- is covered here.
 
-**Primary model: YOLO26s-cls** (`runs/train/yolo26s_cls_bin_v2/weights/best.pt`
--> `models/yolo26s_cls_bin_opset11.onnx`). This is the model this document
-targets end to end. It is the winner of three `training/train.py` retrains
-(see `runs/eval_yolo26s_final.json` for the full evaluation and the README's
-training log for how the three variants compared) -- measured test-split
-top-1 0.9789 (324/331), 3 false positives out of 236 held-out `normal`
-images. That is a marginal, not a decisive, improvement over the incumbent:
+**Primary model: YOLO26s-cls, fine-tuned in tinygrad**
+(`models/yolo26s_cls_bin.onnx` -> `models/yolo26s_cls_bin_finetuned.onnx` ->
+`models/yolo26s_cls_bin_finetuned_opset11.onnx`). This is the model this
+document targets end to end. Rather than retraining the Ultralytics
+classification head from scratch, `training/finetune_yolo_tinygrad.py`
+imports the exported ONNX graph directly via tinygrad's own ONNX runner and
+fine-tunes it in place (batch 32, lr 1e-4, early-stopping patience 8 on
+validation macro-F1 -- best val macro-F1 0.9675 at epoch 9 of 40; see
+`runs/logs/finetune_yolo_tinygrad_metal.log`), writing the trained weights
+back into a new ONNX file with the exact same graph shape, opset, and
+`names` metadata the runtime already reads. On the held-out test split (331
+images, 95 `failure` / 236 `normal`) this measures top-1 **0.9849** (326/331)
+and, critically, the widest, most usable zero-false-positive operating point
+of every variant tried:
 
 | Model | Test top-1 | Failure P / R | False positives / 236 normal | Zero-FP threshold | Recall there |
 |---|---|---|---|---|---|
-| **ResNet18** (`models/argus_bin_opset11.onnx`) | 0.9637 | 0.988 / 0.884 | **1** | 0.75 | 0.674 |
-| YOLO26s, first run (undertrained, `--patience 8`) | 0.9789 | 0.958 / 0.968 | 4 | ~0.998 | 0.811 |
-| **YOLO26s, this doc** (`yolo26s_cls_bin_v2`) | 0.9789 | 0.968 / 0.958 | 3 | 0.99723 | 0.779 |
+| ResNet18 (`models/argus_bin_opset11.onnx`) | 0.9637 | 0.988 / 0.884 | 1 | 0.75 | 0.674 |
+| YOLO26s Ultralytics retrain (`yolo26s_cls_bin_v2`, `models/yolo26s_cls_bin_opset11.onnx`) | 0.9789 | 0.968 / 0.958 | 3 | 0.99723 (0.00005-wide window) | 0.779 |
+| YOLO26s tinygrad fine-tune, patience 30 (`models/yolo26s_cls_bin_ft_p30.onnx`) | higher val F1 | -- | -- | 0.95 | 0.242 (rejected: recall collapses) |
+| **YOLO26s tinygrad fine-tune, patience 8 (this doc)** | **0.9849** | **0.979 / 0.968** | **2** | **~0.78 (0.775-0.805, a 30-point-wide window)** | **0.968** |
 
-Properly training YOLO26s (`--patience 20` instead of the first run's buggy
-`--patience 8`) traded one false positive for one false negative relative to
-the first run -- same top-1, one fewer false alarm -- but ResNet18 still has
-the best false-positive count of the three by a comfortable margin, and by
-far the most comfortable (least fragile) zero-FP threshold. **If the
-Hailo-8's quantized zero-FP threshold re-derivation below doesn't hold up,
-ResNet18 remains the documented fallback** -- see the mandatory
-re-derivation section for exactly when to reach for it.
+Two other candidates were measured and rejected on this same test split
+before settling on the patience-8 fine-tune: the Ultralytics retrain above
+(`yolo26s_cls_bin_v2`, formerly this document's primary model) reaches zero
+false positives only in a 0.00005-wide window pinned against the softmax
+ceiling -- too narrow for INT8's ~256 quantization levels to reliably land
+in -- and a longer tinygrad fine-tune (patience 30) has a higher validation
+F1 but only reaches zero false positives at recall 0.242, which throws away
+most of its ability to actually catch failures. The patience-8 fine-tune
+beats both on the metric that matters for an automated print-pause signal:
+a zero-FP threshold with real recall and real margin. **If the Hailo-8's
+quantized zero-FP threshold re-derivation below doesn't hold up, ResNet18
+remains the documented fallback** -- see the mandatory re-derivation section
+for exactly when to reach for it.
 
 Read `argus.detectors.hailo`'s module docstring before going further. It
 documents the input-format mismatch this whole page exists to get right (Hailo
@@ -77,24 +90,31 @@ published documentation, with sources cited, not from a successful local
 run. Pick based on what your WSL2 setup already has installed.
 
 1. **Ultralytics' own `format="hailo"` export (newest, likely simplest --
-   UNVERIFIED, added after this repo's `ultralytics==8.4.146` pin).**
-   Ultralytics added a one-command export that owns the entire pipeline
-   (`.pt` -> ONNX -> Hailo parse -> INT8 optimize -> HEF compile) behind
-   `model.export(format="hailo", name="hailo8")`, announced by Hailo's own
-   community forum on 2026-08-20 and documented at
+   UNVERIFIED, added after this repo's `ultralytics==8.4.146` pin, and
+   NOT DIRECTLY APPLICABLE to the fine-tuned model this doc targets -- see
+   caveat below).** Ultralytics added a one-command export that owns the
+   entire pipeline (`.pt` -> ONNX -> Hailo parse -> INT8 optimize -> HEF
+   compile) behind `model.export(format="hailo", name="hailo8")`, announced
+   by Hailo's own community forum on 2026-08-20 and documented at
    <https://docs.ultralytics.com/integrations/hailo>. Classification models
-   -- explicitly including YOLO26-cls -- are on its validated list. If this
-   is available in whatever `ultralytics` version you install in your WSL2
-   Ubuntu environment (check `pip show ultralytics`; this repo's own
-   `yolo26s-cls.pt` training happened on `ultralytics==8.4.146`, and it is
-   not confirmed here whether that version or a newer one is what first
-   shipped this feature), it collapses Steps 1 and 3 below into:
+   -- explicitly including YOLO26-cls -- are on its validated list. This
+   path starts from a `.pt` checkpoint, e.g.:
    ```
    pip install ultralytics
    pip install /path/to/hailo_dataflow_compiler-*.whl   # from Hailo's Developer Zone, DFC v3.x for Hailo-8
-   yolo export model=runs/train/yolo26s_cls_bin_v2/weights/best.pt \
+   yolo export model=runs/classify/runs/train/yolo26s_cls_bin/weights/best.pt \
        format=hailo name=hailo8 imgsz=320 data=datasets/argus_bin
    ```
+   **Caveat specific to this doc's primary model:** `training/finetune_yolo_tinygrad.py`
+   fine-tunes ONNX initializer values directly via tinygrad's own ONNX
+   runner -- there is no `.pt` checkpoint that carries the fine-tuned
+   weights, only `models/yolo26s_cls_bin_finetuned.onnx` itself. The command
+   above, run against the pre-fine-tune `.pt`, would compile the WEAKER base
+   checkpoint (test top-1 lower than the fine-tuned model's 0.9849, see the
+   comparison table above), not the model this document targets. Path 3
+   below (the DFC's own Python API, working from the ONNX graph directly) is
+   the one that actually operates on the fine-tuned weights, which is the
+   other reason it is this document's primary path.
    `data=` points it at a classification dataset in the same
    `<root>/train/<class>/*.jpg` layout `training/build_classification_dataset.py`
    already produces, for its own internal calibration sampling -- **UNVERIFIED
@@ -135,36 +155,48 @@ run. Pick based on what your WSL2 setup already has installed.
 ## Step 1 -- re-export the ONNX model at opset 11
 
 **Opset 11 is mandatory. This is the single most common way this whole
-pipeline fails.** The winning checkpoint,
-`runs/train/yolo26s_cls_bin_v2/weights/best.pt`, was trained with
-Ultralytics' default export opset (12) the one time it was auto-exported
-during training; Hailo's ONNX parser requires **opset 11**. Feeding the DFC
-an opset-12 graph typically fails during translation, sometimes with an
-error that doesn't obviously point at the opset at all -- if the DFC's
-`translate_onnx_model` step fails in a way that doesn't make sense, check
-the opset first.
+pipeline fails.** `models/yolo26s_cls_bin_finetuned.onnx` (the fine-tuned
+checkpoint, see above) was written at opset 12 -- the opset the base
+Ultralytics export (`models/yolo26s_cls_bin.onnx`) used before tinygrad
+fine-tuned its weights in place. Hailo's ONNX parser requires **opset 11**.
+Feeding the DFC an opset-12 graph typically fails during translation,
+sometimes with an error that doesn't obviously point at the opset at all --
+if the DFC's `translate_onnx_model` step fails in a way that doesn't make
+sense, check the opset first.
 
-Re-export a **separate** opset-11 ONNX file on this Mac (do not overwrite
-any opset-12 `.onnx` already in `models/` -- nothing else in this repo reads
-`models/yolo26s_cls_bin_opset11.onnx` unless you point it there explicitly,
-so bringing up the Hailo path can't regress anything already working):
+`models/yolo26s_cls_bin_finetuned_opset11.onnx` already exists in this repo,
+produced with:
 
 ```
-PYTHONPATH=src /opt/anaconda3/bin/python3 training/export_classifier_onnx.py \
-    --weights runs/train/yolo26s_cls_bin_v2/weights/best.pt \
-    --imgsz 320 --opset 11 \
-    --out models/yolo26s_cls_bin_opset11.onnx \
-    --test-data datasets/argus_bin/test
+python3 -c "
+import onnx
+from onnx import version_converter
+
+m = onnx.load('models/yolo26s_cls_bin_finetuned.onnx')
+converted = version_converter.convert_version(m, 11)
+onnx.checker.check_model(converted)
+onnx.save(converted, 'models/yolo26s_cls_bin_finetuned_opset11.onnx')
+"
 ```
 
-This is the same export-and-verify script that produced
-`models/yolo26s_cls_bin_opset11.onnx` for this document's own numbers above:
-it re-exports via Ultralytics' own ONNX exporter, then verifies the output
-shape with a raw onnxruntime pass AND runs the real `ClassifierDetector`
-against real held-out test images end to end, so a broken export fails loud
-here rather than silently on the Pi.
+`onnx.version_converter` operates on the graph in place and, unlike a fresh
+Ultralytics re-export, does not need the original `.pt` checkpoint or a
+GPU/MPS device -- and it preserves `metadata_props` (including the `names`
+entry `argus.detectors.classifier` reads) untouched. Verified on all 331
+held-out test images through onnxruntime CPU: **100% argmax agreement, 0.0
+max absolute difference** against the opset-12 model it was converted
+from -- the two files are numerically identical on every image in the test
+split, not just close. If `version_converter` ever fails or produces a graph
+onnxruntime can't run for some future fine-tune, the fallback is to export
+the base Ultralytics checkpoint
+(`runs/classify/runs/train/yolo26s_cls_bin/weights/best.pt`) at opset 11 via
+`training/export_classifier_onnx.py --opset 11 --imgsz 320`, then copy the
+fine-tuned initializer values from `models/yolo26s_cls_bin_finetuned.onnx`
+into it by matching initializer names/shapes/dtypes -- but for this
+checkpoint the direct version-convert route worked cleanly and is what
+`models/yolo26s_cls_bin_finetuned_opset11.onnx` actually is.
 
-Four details read straight from the exported model's own ONNX metadata
+Three details read straight from the exported model's own ONNX metadata
 (`onnxruntime.InferenceSession.get_modelmeta()`), not guessed -- you'll need
 them for Step 3:
 
@@ -172,14 +204,15 @@ them for Step 3:
   to `[0, 1]`.
 - **Output node: `output0`**, shape `(1, 2)`. **Unlike the ResNet18/tinygrad
   ONNX path (`models/argus_bin_opset11.onnx`, output node `logits`, raw
-  logits), this graph's own final op is a `Softmax`** -- verified by running
-  a random input through it and confirming the two output values sum to
-  exactly 1.0. `argus.detectors.classifier.probabilities_from_output` (used
-  by both `ClassifierDetector` and `HailoDetector.predict_proba`)
-  auto-detects raw-logits-vs-already-softmaxed either way, so this doesn't
-  require any code change -- but it matters for Step 3's `translate_onnx_model`
-  call, where the DFC needs to know it's translating a graph that already
-  ends in a Softmax.
+  logits), this graph's own final op is a `Softmax`, so `output0` is
+  ALREADY a valid probability distribution** -- verified by running a random
+  input through it and confirming the two output values sum to exactly 1.0.
+  `argus.detectors.classifier.probabilities_from_output` (used by both
+  `ClassifierDetector` and `HailoDetector.predict_proba`) auto-detects
+  raw-logits-vs-already-softmaxed either way, so this doesn't require any
+  code change -- but it matters for Step 3's `translate_onnx_model` call,
+  where the DFC needs to know it's translating a graph that already ends in
+  a Softmax.
 - **Class order: `{0: 'failure', 1: 'normal'}`**, read from
   `custom_metadata_map["names"]` -- alphabetical, and happens to match
   `config.trident.yaml`'s ResNet18 order, but confirmed independently rather
@@ -230,7 +263,7 @@ import numpy as np
 import cv2
 from hailo_sdk_client import ClientRunner
 
-ONNX_PATH = "yolo26s_cls_bin_opset11.onnx"
+ONNX_PATH = "yolo26s_cls_bin_finetuned_opset11.onnx"
 CALIB_DIR = "hailo_calib"
 HEF_OUT = "yolo26s_cls_bin.hef"
 INPUT_SIZE = 320
@@ -244,10 +277,10 @@ runner = ClientRunner(hw_arch="hailo8")  # NOT "hailo8l" -- see warning below
 # at the very end of the graph without complaint. If translate_onnx_model
 # rejects it, the alternative is to stop one node earlier, at the Softmax's
 # own input (the pre-softmax Gemm output) -- inspect the graph directly
-# (e.g. `onnx.load("yolo26s_cls_bin_opset11.onnx").graph.node`, or open it in
-# https://netron.app) to find that node's real output name, since it is not
-# reproduced here to avoid stating a name that may not match your exact
-# export. Either choice works with this repo's own evaluation and runtime
+# (e.g. `onnx.load("yolo26s_cls_bin_finetuned_opset11.onnx").graph.node`, or
+# open it in https://netron.app) to find that node's real output name, since
+# it is not reproduced here to avoid stating a name that may not match your
+# exact export. Either choice works with this repo's own evaluation and runtime
 # code unmodified -- probabilities_from_output auto-detects raw-logits-vs
 # -already-softmaxed either way (see Step 1) -- so this is purely a DFC
 # compatibility question, not a correctness one.
@@ -269,7 +302,7 @@ runner.translate_onnx_model(
 # reference. Getting this step wrong or skipping it does not raise an error
 # anywhere in this pipeline; it just silently and systematically skews every
 # confidence the compiled model produces relative to the fp32 ONNX model
-# runs/eval_yolo26s_final.json was measured against.
+# runs/eval_yolo26s_finetuned_opset11.json was measured against.
 runner.load_model_script(
     "normalization1 = normalization([0.0, 0.0, 0.0], [255.0, 255.0, 255.0])\n"
 )
@@ -325,7 +358,7 @@ If you'd rather use the `hailomz compile` CLI wrapper instead (option 2
 above), the command shape is:
 
 ```
-hailomz compile --ckpt yolo26s_cls_bin_opset11.onnx \
+hailomz compile --ckpt yolo26s_cls_bin_finetuned_opset11.onnx \
     --calib-path datasets/hailo_calib \
     --yaml path/to/your-classifier.yaml \
     --hw-arch hailo8
@@ -388,9 +421,9 @@ detector:
                                         # HEF itself (see below)
   default_threshold: 0.50
   class_thresholds:
-    failure: 0.99723   # PLACEHOLDER -- SEE THE WARNING BELOW, this value is NOT valid
-                        # for the quantized model yet, and is especially unlikely to
-                        # survive unchanged given how close it sits to 1.0
+    failure: 0.78   # PLACEHOLDER -- SEE THE WARNING BELOW, this value is the fp32
+                     # measurement and is NOT valid for the quantized model until
+                     # re-derived on the compiled HEF
     normal: 0.50
   severity:
     failure: catastrophic
@@ -410,27 +443,30 @@ says in Step 1 -- for this model that's `["failure", "normal"]`.
 ## MANDATORY: re-derive the confidence threshold before trusting this
 
 **INT8 quantization shifts the confidence distribution the model produces --
-and this model's operating point is unusually exposed to that shift.**
+this is true of every model it quantizes, and this one is not exempt just
+because its fp32 margin is comfortable.**
 
-> **PROMINENT WARNING, specific to this model.** YOLO26s-cls's own measured
-> zero-false-positive threshold is **0.99723** -- extremely close to the
-> softmax ceiling of 1.0 (see `runs/eval_yolo26s_final_finesweep.json`; a
-> finer local sweep pinned the exact false-positive boundary to
-> `(0.997205, 0.99726)`, a window barely 0.00005 wide). INT8 gives you
-> roughly 256 distinct quantization levels across a tensor's whole dynamic
-> range, and the levels available in the last thousandth of a softmax output
-> approaching 1.0 are sparse to begin with even before quantization error is
-> considered -- there is almost no resolution left up there for INT8 to
-> represent faithfully. This is NOT a hypothetical concern the way it might
-> be phrased for a model with more headroom: it is entirely plausible that
-> quantization moves this specific model's zero-FP boundary by more than
-> 0.00005, collapses the gap between "zero FP" and "no positive predictions
-> at all," or removes the zero-FP operating point at a usable recall
-> entirely. **Do not deploy `class_thresholds.failure: 0.99723` (or any
-> value carried over unmodified from the fp32 measurement) against the
-> compiled HEF.** Re-derive it for real, below, before this config is
-> trusted for anything beyond generating notifications you personally
-> review.
+> **This model's zero-FP threshold sits mid-range, not fragile -- but that's
+> not a reason to skip re-deriving it.** YOLO26s-cls's own measured
+> zero-false-positive threshold is **~0.78** (precisely: precision reaches
+> 1.000 at 0.775 and recall 0.968 holds through 0.805 -- see
+> `runs/eval_yolo26s_finetuned_zerofp_pinpoint.json`), a **30-point-wide**
+> window, nowhere near the softmax ceiling of 1.0. INT8's roughly 256
+> quantization levels across a tensor's dynamic range can represent a window
+> this wide without difficulty -- unlike the earlier Ultralytics-retrain
+> model's 0.99723, a 0.00005-wide window pinned against that ceiling, which
+> INT8 realistically could not have represented. That difference is exactly
+> why this model was chosen over that one for the Hailo path. **It does
+> NOT mean the threshold survives quantization unexamined.** INT8 still
+> shifts the whole confidence distribution the model produces -- by how
+> much, in which direction, is not knowable without measuring it on the
+> actual compiled HEF. A window being wide only means it is more likely to
+> still contain a usable operating point after that shift, not that the
+> specific value 0.78 will still be correct. **Do not deploy
+> `class_thresholds.failure: 0.78` (or any value carried over unmodified
+> from the fp32 measurement) against the compiled HEF.** Re-derive it for
+> real, below, before this config is trusted for anything beyond generating
+> notifications you personally review.
 
 Re-run the real evaluation script, on the Pi (or any Linux box with
 `hailo_platform` installed and the HEF reachable), against the compiled HEF,
@@ -442,16 +478,17 @@ PYTHONPATH=src python3 training/evaluate_classifier.py \
     --data datasets/argus_bin --split test \
     --imgsz 320 \
     --catastrophic-class failure --class-names failure,normal \
-    --sweep-start 0.90 --sweep-end 0.9999 --sweep-step 0.0005 \
+    --sweep-start 0.60 --sweep-end 0.95 --sweep-step 0.005 \
     --out runs/eval_yolo26s_hailo_hef.json
 ```
 
 (`--data datasets/argus_bin` matters -- the script's own default,
-`datasets/argus_cls`, is the unrelated 6-class dataset. The wide
-`--sweep-start`/`--sweep-end` matters too: the fp32 model's own zero-FP
-point sits above the script's ordinary default sweep range of 0.05-0.95, and
-there is no reason to assume the quantized model's own zero-FP point, if it
-has one, lands somewhere more convenient.)
+`datasets/argus_cls`, is the unrelated 6-class dataset. The
+`--sweep-start`/`--sweep-end` range is centered on the fp32 model's own
+zero-FP window (0.775-0.805) with margin on both sides, not the script's
+ordinary default of 0.05-0.95 in coarse 0.025 steps -- there is no reason to
+assume the quantized model's own zero-FP point, if it has one, lands exactly
+where the fp32 model's did, so scan around it rather than only at it.)
 
 This runs the exact same confusion matrix / per-class P-R / confidence-sweep
 report `training/evaluate_classifier.py` has always produced, just routed
@@ -464,19 +501,21 @@ the script to read the way it reads ONNX's `custom_metadata_map`, so there's
 no fallback if you get this flag wrong or omit it -- the script refuses to
 run without it rather than guessing.
 
-Read the printed `[4] p_failure ANALYSIS` sweep the same way `0.99723` was
+Read the printed `[4] p_failure ANALYSIS` sweep the same way `0.78` was
 chosen for the fp32 model above: find the lowest confidence threshold that
 reaches zero false positives (precision 1.000) at a real, non-vacuous
-recall, and put that number -- not `0.99723` unmodified -- into
+recall, and put that number -- not `0.78` unmodified -- into
 `class_thresholds.failure` in your Hailo config, along with a comment
 recording the HEF's own measured recall at that threshold the same way this
 document records the fp32 number.
 
 **If the quantized model can't reach precision 1.000 at any usable recall,
-that is real information, not a bug to work around.** Given how thin this
-model's fp32 margin already is (a 0.00005-wide window), that outcome
-would not be surprising. If it happens: **`models/argus_bin_opset11.onnx`
-(the ResNet18 model) is the documented fallback and remains available** --
+that is real information, not a bug to work around.** This model's fp32
+margin is comfortable (a 30-point-wide window), so that outcome would be
+more surprising here than it would have been for the rejected 0.99723
+candidate -- but it is still not guaranteed, and must be measured, not
+assumed. If it happens: **`models/argus_bin_opset11.onnx` (the ResNet18
+model) is the documented fallback and remains available** --
 its own zero-FP threshold, 0.75, was measured with real margin on both
 sides (precision is already 0.988 flat from confidence 0.05 to 0.70, only
 climbing to 1.000 at 0.75 -- see `runs/eval_bin_test.json`), which is
